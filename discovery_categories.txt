@@ -1,0 +1,4 @@
+# Category slugs from Kalshi URLs (path segment between event and market ticker)
+kxncaambgame
+kxncaawbgame
+kxncaabbgame
