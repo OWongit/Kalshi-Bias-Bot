@@ -83,6 +83,8 @@ def compute_order_sizes(
     balance_cents: int,
     qualified: list[tuple[str, str, int, dict]],
     current_no_tickers: set[str],
+    current_yes_tickers: set[str],
+    tickers_with_open_orders: set[str],
     max_pct: float,
     max_positions: int,
     min_contracts: int,
@@ -90,8 +92,10 @@ def compute_order_sizes(
 ) -> list[tuple[str, str, int, dict]]:
     """Decide how many contracts to buy for each qualified market.
 
+    Skips markets that already have a position or an open order.
     Returns [(ticker, event_ticker, count, params)].
     """
+    excluded = current_no_tickers | current_yes_tickers | tickers_with_open_orders
     available_slots = max_positions - len(current_no_tickers)
     if available_slots <= 0:
         log.info("No open position slots (max %d reached)", max_positions)
@@ -101,7 +105,7 @@ def compute_order_sizes(
     for ticker, event_ticker, no_bid, params in qualified:
         if len(orders) >= available_slots:
             break
-        if ticker in current_no_tickers:
+        if ticker in excluded:
             continue
         allocation = balance_cents * max_pct
         if no_bid <= 0:
@@ -117,16 +121,51 @@ def compute_order_sizes(
 # Order placement
 # ---------------------------------------------------------------------------
 
+def _supports_deci_cent_at_price(structure: str, no_bid_cents: int) -> bool:
+    """True if market supports 0.1¢ tick at this price level."""
+    if structure == "deci_cent":
+        return True
+    if structure == "tapered_deci_cent":
+        return no_bid_cents < 10 or no_bid_cents > 90
+    return False
+
+
+def _format_limit_price(
+    no_bid: int,
+    no_bid_dollars: str | None,
+    structure: str,
+    offset_deci_cents: bool,
+) -> tuple[int | None, str | None, int | float]:
+    """Compute limit price (bid + 0.1¢ or +1¢). Returns (price_cents, price_dollars, display_price)."""
+    if offset_deci_cents and _supports_deci_cent_at_price(structure, no_bid):
+        # Use no_price_dollars: bid + 0.001 dollars (0.1¢)
+        if no_bid_dollars:
+            try:
+                bid_val = float(no_bid_dollars)
+                limit_val = min(0.99, bid_val + 0.001)
+                price_dollars = f"{limit_val:.4f}"
+                display_price = round(limit_val * 1000) / 10  # e.g. 94.1
+                return (round(limit_val * 100), price_dollars, display_price)
+            except (ValueError, TypeError):
+                pass
+        # Fallback: compute from cents
+        limit_cents = min(99, no_bid + 1)  # 1¢ when dollars unavailable
+        return (limit_cents, None, limit_cents)
+    # linear_cent or middle of tapered: +1¢
+    limit_cents = max(1, min(99, no_bid + 1))
+    return (limit_cents, None, limit_cents)
+
+
 def place_entry_orders(
     client,
     orders_to_place: list[tuple[str, str, int, dict]],
     prices: dict[str, dict],
     dry_run: bool,
-) -> list[tuple[str, int, int, str]]:
+) -> list[tuple[str, int, int | float, str]]:
     """Place limit-buy NO orders for each entry, with a final re-check.
-    Each order includes params for per-category entry_price and max_spread.
-    Returns [(ticker, count, price_cents, order_id), ...] for placed orders."""
-    placed: list[tuple[str, int, int, str]] = []
+    Uses no_price_dollars for deci-cent markets (0.1¢ above bid), else no_price (+1¢).
+    Returns [(ticker, count, price_cents_or_float, order_id), ...] for placed orders."""
+    placed: list[tuple[str, int, int | float, str]] = []
     for ticker, event_ticker, count, params in orders_to_place:
         p = prices.get(ticker)
         if p is None:
@@ -149,20 +188,34 @@ def place_entry_orders(
             log.info("NO bid %s out of range for %s; skipping", no_bid, ticker)
             continue
 
-        limit_price = max(1, min(99, no_bid))
+        structure = p.get("price_level_structure", "linear_cent")
+        no_bid_dollars = p.get("no_bid_dollars")
+        price_cents, price_dollars, display_price = _format_limit_price(
+            no_bid, no_bid_dollars, structure, offset_deci_cents=True
+        )
+
         if dry_run:
-            placed.append((ticker, count, limit_price, "dry-run"))
+            placed.append((ticker, count, display_price, "dry-run"))
             continue
 
         try:
-            order = client.create_order(
-                ticker=ticker,
-                side="no",
-                action="buy",
-                count=count,
-                price_cents=limit_price,
-            )
-            placed.append((ticker, count, limit_price, order.get("order_id", "?")))
+            if price_dollars is not None:
+                order = client.create_order(
+                    ticker=ticker,
+                    side="no",
+                    action="buy",
+                    count=count,
+                    price_dollars=price_dollars,
+                )
+            else:
+                order = client.create_order(
+                    ticker=ticker,
+                    side="no",
+                    action="buy",
+                    count=count,
+                    price_cents=price_cents,
+                )
+            placed.append((ticker, count, display_price, order.get("order_id", "?")))
         except Exception:
             log.exception("Failed to place order for %s", ticker)
         time.sleep(0.1)
@@ -180,13 +233,13 @@ def run_stop_loss(
     prices: dict[str, dict],
     stop_loss_map: dict[str, int],
     dry_run: bool,
-) -> tuple[set[str], list[tuple[str, str, int, int, str]]]:
+) -> tuple[set[str], list[tuple[str, str, int, int | float, str]]]:
     """Sell positions whose bid has dropped to or below the stop-loss threshold.
 
     stop_loss_map: ticker -> stop_loss_cents (per-market).
-    Returns (sold_tickers, [(ticker, side, qty, price_cents, order_id), ...])."""
+    Returns (sold_tickers, [(ticker, side, qty, price_cents_or_float, order_id), ...])."""
     sold: set[str] = set()
-    sold_orders: list[tuple[str, str, int, int, str]] = []
+    sold_orders: list[tuple[str, str, int, int | float, str]] = []
     for pos in positions:
         ticker = pos.get("ticker", "")
         position = pos.get("position", 0)
@@ -203,38 +256,62 @@ def run_stop_loss(
             # NO position
             qty = abs(position)
             bid = p.get("no_bid")
+            bid_dollars = p.get("no_bid_dollars")
             if bid is None:
                 continue
             if bid > stop_loss_cents:
                 continue
-            sell_price = max(1, min(99, bid))
             side = "no"
         else:
             # YES position
             qty = position
             bid = p.get("yes_bid")
+            bid_dollars = p.get("yes_bid_dollars")
             if bid is None:
                 continue
             if bid > stop_loss_cents:
                 continue
-            sell_price = max(1, min(99, bid))
             side = "yes"
+
+        structure = p.get("price_level_structure", "linear_cent")
+        use_dollars = False
+        sell_price_dollars = ""
+        sell_price = max(1, min(99, bid))
+        display_price: int | float = sell_price
+
+        if _supports_deci_cent_at_price(structure, bid) and bid_dollars:
+            try:
+                sell_val = float(bid_dollars)
+                sell_price_dollars = f"{max(0.01, min(0.99, sell_val)):.4f}"
+                display_price = round(sell_val * 1000) / 10
+                use_dollars = True
+            except (ValueError, TypeError):
+                pass
 
         if dry_run:
             sold.add(ticker)
-            sold_orders.append((ticker, side.upper(), qty, sell_price, "dry-run"))
+            sold_orders.append((ticker, side.upper(), qty, display_price, "dry-run"))
             continue
 
         try:
-            order = client.create_order(
-                ticker=ticker,
-                side=side,
-                action="sell",
-                count=qty,
-                price_cents=sell_price,
-            )
+            if use_dollars:
+                order = client.create_order(
+                    ticker=ticker,
+                    side=side,
+                    action="sell",
+                    count=qty,
+                    price_dollars=sell_price_dollars,
+                )
+            else:
+                order = client.create_order(
+                    ticker=ticker,
+                    side=side,
+                    action="sell",
+                    count=qty,
+                    price_cents=sell_price,
+                )
             sold.add(ticker)
-            sold_orders.append((ticker, side.upper(), qty, sell_price, order.get("order_id", "?")))
+            sold_orders.append((ticker, side.upper(), qty, display_price, order.get("order_id", "?")))
         except Exception:
             log.exception("Stop-loss order failed for %s", ticker)
 

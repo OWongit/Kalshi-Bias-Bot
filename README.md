@@ -9,6 +9,7 @@ An automated trading bot for [Kalshi](https://kalshi.com) that discovers markets
 **Raspberry Pi:** Run the install script for a full setup (venv, dependencies, desktop autostart):
 
 ```bash
+chmod +x install.sh
 ./install.sh
 ```
 

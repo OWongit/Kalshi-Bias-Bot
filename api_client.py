@@ -60,12 +60,30 @@ def parse_market_prices(market: dict) -> dict:
             except (ValueError, TypeError):
                 pass
 
+    # Raw dollars for deci-cent pricing (Fixed-Point v2)
+    no_bid_dollars = market.get("no_bid_dollars")
+    if no_bid_dollars is None and market.get("yes_ask_dollars") is not None:
+        try:
+            no_bid_dollars = f"{1 - float(market['yes_ask_dollars']):.4f}"
+        except (ValueError, TypeError):
+            pass
+    yes_bid_dollars = market.get("yes_bid_dollars")
+    if yes_bid_dollars is None and market.get("no_ask_dollars") is not None:
+        try:
+            yes_bid_dollars = f"{1 - float(market['no_ask_dollars']):.4f}"
+        except (ValueError, TypeError):
+            pass
+    price_level_structure = market.get("price_level_structure", "linear_cent")
+
     return {
         "yes_bid": yes_bid,
         "yes_ask": yes_ask,
         "no_bid": no_bid,
         "no_ask": no_ask,
         "open_interest": oi,
+        "no_bid_dollars": no_bid_dollars,
+        "yes_bid_dollars": yes_bid_dollars,
+        "price_level_structure": price_level_structure,
     }
 
 
@@ -161,6 +179,21 @@ class KalshiClient:
                 break
         return positions
 
+    def get_orders(self, status: str = "resting") -> list[dict]:
+        """Return open orders (resting by default)."""
+        orders: list[dict] = []
+        cursor = ""
+        while True:
+            params: dict = {"limit": 1000, "status": status}
+            if cursor:
+                params["cursor"] = cursor
+            data = self.get("/portfolio/orders", params=params)
+            orders.extend(data.get("orders", []))
+            cursor = data.get("cursor", "")
+            if not cursor:
+                break
+        return orders
+
     def get_markets(
         self,
         series_ticker: str | None = None,
@@ -239,18 +272,31 @@ class KalshiClient:
         side: str,
         action: str,
         count: int,
-        price_cents: int,
+        price_cents: int | None = None,
+        price_dollars: str | None = None,
     ) -> dict:
-        """Place an order. Returns the order dict from the API."""
+        """Place an order. Returns the order dict from the API.
+
+        Use price_dollars for deci-cent markets (e.g. "0.9410" for 94.1¢).
+        Use price_cents for linear_cent markets. Exactly one must be set.
+        """
         body: dict = {
             "ticker": ticker,
             "side": side,
             "action": action,
             "count": count,
         }
-        if side == "no":
-            body["no_price"] = price_cents
+        if price_dollars is not None:
+            if side == "no":
+                body["no_price_dollars"] = price_dollars
+            else:
+                body["yes_price_dollars"] = price_dollars
+        elif price_cents is not None:
+            if side == "no":
+                body["no_price"] = price_cents
+            else:
+                body["yes_price"] = price_cents
         else:
-            body["yes_price"] = price_cents
+            raise ValueError("Either price_cents or price_dollars must be provided")
         data = self.post("/portfolio/orders", json_body=body)
         return data.get("order", data)

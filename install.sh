@@ -58,6 +58,7 @@ sudo apt-get install -y \
     python3-dev \
     libgpiod-dev \
     lxterminal \
+    wmctrl \
     git
 
 # Create virtual environment
@@ -96,12 +97,13 @@ AUTOSTART_DIR="$HOME/.config/autostart"
 mkdir -p "$AUTOSTART_DIR"
 AUTOSTART_FILE="$AUTOSTART_DIR/kalshi-trader.desktop"
 # Use launcher.sh so it uses the venv and runs main.py
+# Launch lxterminal with a title, then maximize it after a short delay
 cat > "$AUTOSTART_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=${DISPLAY_NAME}
 Comment=Run ${DISPLAY_NAME} in a terminal window
-Exec=lxterminal -e "cd $SCRIPT_DIR && $SCRIPT_DIR/launcher.sh; exec bash"
+Exec=bash -c 'lxterminal -t "${DISPLAY_NAME}" -e "cd $SCRIPT_DIR && $SCRIPT_DIR/launcher.sh; exec bash" & sleep 2 && wmctrl -r "${DISPLAY_NAME}" -b add,maximized_vert,maximized_horz'
 X-GNOME-Autostart-enabled=true
 EOF
 echo "  Created $AUTOSTART_FILE"

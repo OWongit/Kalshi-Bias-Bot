@@ -77,11 +77,13 @@ def main() -> None:
 
     # ticker -> timestamp when cooldown expires
     cooldown_map: dict[str, float] = {}
+    # tickers we just placed orders for (avoids duplicates when get_orders lags)
+    recently_placed_tickers: set[str] = set()
 
     # -- main loop ---------------------------------------------------------
     while True:
         try:
-            _run_iteration(client, cooldown_map)
+            _run_iteration(client, cooldown_map, recently_placed_tickers)
         except KeyboardInterrupt:
             break
         except Exception:
@@ -99,7 +101,11 @@ def _extract_series(ticker: str) -> str:
     return ticker.split("-", 1)[0] if "-" in ticker else ticker
 
 
-def _run_iteration(client: KalshiClient, cooldown_map: dict[str, float]) -> None:
+def _run_iteration(
+    client: KalshiClient,
+    cooldown_map: dict[str, float],
+    recently_placed_tickers: set[str],
+) -> None:
     now = time.time()
 
     # 1. Discovery
@@ -117,6 +123,16 @@ def _run_iteration(client: KalshiClient, cooldown_map: dict[str, float]) -> None
     # 2. Portfolio state
     positions = client.get_positions()
     balance = client.get_balance()
+    try:
+        open_orders = client.get_orders(status="resting")
+    except Exception:
+        log.warning("Failed to fetch open orders; using recently_placed only")
+        open_orders = []
+    tickers_with_open_orders: set[str] = {o.get("ticker", "") for o in open_orders if o.get("ticker")}
+    # Remove from recently_placed any ticker now confirmed in open_orders
+    recently_placed_tickers -= tickers_with_open_orders
+    # Exclude both open orders and recently placed (handles API lag)
+    tickers_with_open_orders = tickers_with_open_orders | recently_placed_tickers
 
     current_no_tickers: set[str] = set()
     current_yes_tickers: set[str] = set()
@@ -151,9 +167,9 @@ def _run_iteration(client: KalshiClient, cooldown_map: dict[str, float]) -> None
         prices, candidates, active_cooldowns,
     )
 
-    # 6. Compute order sizes
+    # 6. Compute order sizes (exclude markets with positions or open orders)
     orders_to_place = compute_order_sizes(
-        balance, qualified, current_no_tickers,
+        balance, qualified, current_no_tickers, current_yes_tickers, tickers_with_open_orders,
         config.MAX_PCT_PER_MARKET, config.MAX_OPEN_POSITIONS,
         config.MIN_CONTRACTS, config.MAX_CONTRACTS,
     )
@@ -166,6 +182,7 @@ def _run_iteration(client: KalshiClient, cooldown_map: dict[str, float]) -> None
     for ticker, count, price, order_id in placed:
         _print_order_placed(ticker, count, price, order_id, config.DRY_RUN)
     if placed:
+        recently_placed_tickers.update(ticker for ticker, _, _, _ in placed)
         balance = client.get_balance()
         positions = client.get_positions()
         _print_balance_positions(balance, positions)
