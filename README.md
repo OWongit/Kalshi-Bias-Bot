@@ -1,38 +1,102 @@
-# Kalshi Trading Bot
+# Kalshi Automated NO Trading Bot
 
-Bot that discovers markets on Kalshi and applies the same entry and stop-loss logic to **both YES and NO**: places limit buy **YES** at the YES ask when YES bid ≥ 95¢ and YES spread ≤ 1¢, and limit buy **NO** at the NO ask when NO bid ≥ 95¢ and NO spread ≤ 1¢. Runs a 70¢ stop loss on both YES and NO positions. Bet sizing is based on account balance (configurable max % per market and max open positions per side).
+An automated trading bot for [Kalshi](https://kalshi.com) that discovers markets from category/series slugs, opens **NO** positions under strict entry rules, sizes bets from your balance, and manages risk with a stop-loss.
 
-## Setup
+## Quick Start
 
-1. **Environment**: Copy `.env.example` to `.env` and set:
+### 1. Install dependencies
 
-   - `KALSHI_API_KEY_ID` – your API key ID from Kalshi (Account & security → API Keys)
-   - `KALSHI_PRIVATE_KEY_PATH` – path to your private key `.pem`/`.key` file, **or**
-   - `KALSHI_PRIVATE_KEY` – PEM string (e.g. `"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"`)
-   - `KALSHI_BASE_URL` – optional; default is demo: `https://demo-api.kalshi.co/trade-api/v2`
+**Raspberry Pi:** Run the install script for a full setup (venv, dependencies, desktop autostart):
 
-2. **Optional overrides** in `.env`:
-
-   - `ENTRY_MIN_PRICE_CENTS=95` – only buy YES/NO when that side’s bid is at or above this; order is placed at that side’s ask (default 95)
-   - `MAX_SPREAD_CENTS=1` – only buy when that side’s bid-ask spread is at most this many cents (default 1)
-   - `STOP_LOSS_CENTS=70` – sell YES when YES bid ≤ this, sell NO when NO bid ≤ this (default 70)
-   - `MAX_PCT_PER_MARKET=10` – max % of balance per market order (default 10)
-   - `MAX_OPEN_POSITIONS=10` – max number of markets per side (YES and NO each get up to this many; default 10)
-   - `STOP_LOSS_POLL_SECONDS=30` – seconds between main loop cycles (default 30)
-   - `DRY_RUN=true` – log only, no real orders (default false)
-   - `DISCOVERY_CATEGORIES_FILE=discovery_categories.txt` – path to a file with one **category slug** per line (e.g. `mens-college-basketball-mens-game` from the Kalshi URL path)
-
-## Discovery
-
-The bot discovers candidate markets only from the **discovery categories file** (`DISCOVERY_CATEGORIES_FILE`, default `discovery_categories.txt`). Each line is a **category slug** (the URL path segment, e.g. `mens-college-basketball-mens-game`). For each slug it finds series in that category and collects all open, active markets. If the file is empty or yields no markets, the bot logs “No markets found this cycle.”
-
-## Discovery: categories file
-
-Add category slugs to **`discovery_categories.txt`** (or set `DISCOVERY_CATEGORIES_FILE` to another path):
-
-```text
-# Category slugs from Kalshi URLs (path segment between event and market ticker)
-mens-college-basketball-mens-game
+```bash
+./install.sh
 ```
 
-The bot discovers series for each slug (via the API or client-side filter), then all open, active markets in those series, and applies entry/stop-loss to each (subject to max positions and bet sizing).
+Requires Raspberry Pi OS with Desktop and Desktop Autologin enabled (`raspi-config` → Boot → Desktop Autologin).
+
+**Other platforms:**
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Configure credentials
+
+Open `config.py` and set:
+
+- **`API_KEY_ID`** — your Kalshi API key ID.
+- **`PRIVATE_KEY_PATH`** — path to the `.key` file downloaded when you created the API key. If the file is not available, set `PRIVATE_KEY_STRING` to the PEM text instead (literal `\n` is supported).
+
+### 3. Choose environment
+
+| Environment | `BASE_URL` |
+|-------------|------------|
+| **Demo** (default) | `https://demo-api.kalshi.co` |
+| **Production** | `https://api.elections.kalshi.com` |
+
+Start with Demo to test safely.
+
+### 4. Edit the categories config
+
+Edit `categories.json` to add categories (slugs or series tickers) and per-category trading params:
+
+```json
+{
+  "defaults": {
+    "entry_price": 95,
+    "stop_loss": 70,
+    "max_spread": 2,
+    "min_open_interest": null,
+    "stop_out_cooldown_seconds": 300
+  },
+  "categories": [
+    {"slug": "kxncaambgame"},
+    {"slug": "kxeth15m", "entry_price": 90, "stop_loss": 0, "max_spread": 1}
+  ]
+}
+```
+
+Each category can override any default. Omit fields to use defaults.
+
+### 5. Run
+
+```bash
+python main.py
+```
+
+The bot starts in **dry-run mode** by default (`DRY_RUN = True` in `config.py`). It will log what orders it *would* place without actually sending them. Set `DRY_RUN = False` when you are ready to trade live.
+
+## How It Works
+
+1. **Discovery** — reads `categories.json`, resolves each slug to series tickers, then fetches open markets. Per-category params (entry_price, stop_loss, max_spread, min_open_interest, stop_out_cooldown_seconds) apply per market.
+2. **Entry** — only buys NO. Qualifies a market when the NO ask equals the category's `entry_price` exactly and the spread is at most `max_spread`. Posts a limit buy at the NO bid (maker order).
+3. **Sizing** — allocates `MAX_PCT_PER_MARKET` of your balance per market, clamped between `MIN_CONTRACTS` and `MAX_CONTRACTS`. Respects `MAX_OPEN_POSITIONS`.
+4. **Stop-loss** — for every open YES or NO position, if the bid on that side falls to or below the category's `stop_loss`, places a limit sell at the current bid.
+5. **Cooldown** — tickers sold by stop-loss are excluded from re-entry for the category's `stop_out_cooldown_seconds`.
+6. **Loop** — sleeps `STOP_LOSS_POLL_SECONDS` between iterations.
+
+## Configuration Reference
+
+All settings live in `config.py`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `categories.json` | — | Per-category: entry_price, stop_loss, max_spread, min_open_interest, stop_out_cooldown_seconds |
+| `MAX_OPEN_POSITIONS` | 5 | Max concurrent NO markets |
+| `MAX_PCT_PER_MARKET` | 0.10 | Fraction of balance per market |
+| `MIN_CONTRACTS` | 1 | Minimum contracts per order |
+| `MAX_CONTRACTS` | 10,000 | Maximum contracts per order |
+| `STOP_LOSS_POLL_SECONDS` | 30 | Sleep between loop iterations |
+| `DRY_RUN` | True | Log orders without sending |
+
+## Project Structure
+
+```
+config.py          Configuration and credential loading
+api_client.py      Authenticated Kalshi HTTP client (RSA-PSS signing)
+discovery.py       Market discovery from categories/series
+trading.py         Entry logic, bet sizing, stop-loss
+main.py            Main loop orchestrator
+categories.json    Categories with per-category trading params
+requirements.txt   Python dependencies
+```

@@ -1,8 +1,4 @@
-.env
-*.pem
 __pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-env/
+my_config.py
+.venv
+private_key.pem

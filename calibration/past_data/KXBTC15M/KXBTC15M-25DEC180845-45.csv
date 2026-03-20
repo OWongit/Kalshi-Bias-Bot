@@ -1,0 +1,6 @@
+end_period_ts,yes_bid_open,yes_bid_high,yes_bid_low,yes_bid_close,yes_ask_open,yes_ask_high,yes_ask_low,yes_ask_close,price_open,price_high,price_low,price_close,price_mean,volume,open_interest
+1766064660,65,65,65,65,100,100,100,100,,,,,,0,0
+1766064780,65,65,0,0,100,100,100,100,,,,,,0,0
+1766064960,0,50,0,50,100,100,100,100,,,,,,0,0
+1766065140,50,80,50,80,100,100,100,100,,,,,,0,0
+1766065380,80,80,0,0,100,100,100,100,,,,,,0,0
