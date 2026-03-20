@@ -246,8 +246,8 @@ def run_stop_loss(
         if position == 0:
             continue
         stop_loss_cents = stop_loss_map.get(ticker)
-        if stop_loss_cents is None:
-            continue
+        if stop_loss_cents is None or stop_loss_cents == 0:
+            continue  # 0 = stop-loss disabled
         p = prices.get(ticker)
         if p is None:
             continue

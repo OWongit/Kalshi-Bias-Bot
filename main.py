@@ -75,6 +75,10 @@ def main() -> None:
         print(f"{C['red']}Check API_KEY_ID, private key, and BASE_URL (demo vs production).{C['reset']}")
         sys.exit(1)
 
+    balance = client.get_balance()
+    positions = client.get_positions()
+    _print_balance_positions(balance, positions)
+
     # ticker -> timestamp when cooldown expires
     cooldown_map: dict[str, float] = {}
     # tickers we just placed orders for (avoids duplicates when get_orders lags)

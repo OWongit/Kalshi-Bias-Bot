@@ -165,7 +165,8 @@ class KalshiClient:
         return data["balance"]
 
     def get_positions(self, count_filter: str = "position") -> list[dict]:
-        """Return all market positions (paginated)."""
+        """Return all market positions (paginated).
+        Normalizes position_fp (Fixed-Point v2) to position (int) for compatibility."""
         positions: list[dict] = []
         cursor = ""
         while True:
@@ -173,7 +174,14 @@ class KalshiClient:
             if cursor:
                 params["cursor"] = cursor
             data = self.get("/portfolio/positions", params=params)
-            positions.extend(data.get("market_positions", []))
+            for p in data.get("market_positions", []):
+                pos = dict(p)
+                if "position" not in pos and "position_fp" in pos:
+                    try:
+                        pos["position"] = int(float(str(pos["position_fp"])))
+                    except (ValueError, TypeError):
+                        pos["position"] = 0
+                positions.append(pos)
             cursor = data.get("cursor", "")
             if not cursor:
                 break
