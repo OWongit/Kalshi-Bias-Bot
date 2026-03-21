@@ -33,7 +33,7 @@ MAX_PCT_PER_MARKET = 0.03       # Fraction of balance allocated per new market (
 MIN_CONTRACTS = 1               # Minimum contracts per order
 MAX_CONTRACTS = 10_000          # Maximum contracts per order
 
-STOP_LOSS_POLL_SECONDS =   0.05     # Sleep between main-loop iterations
+STOP_LOSS_POLL_SECONDS =   0.10     # Sleep between main-loop iterations
 DRY_RUN = False                  # True = log orders without sending them
 
 # ---------------------------------------------------------------------------
@@ -56,12 +56,25 @@ def load_categories_config(filepath: str) -> dict:
     with open(filepath, encoding="utf-8") as f:
         data = json.load(f)
     defaults = data.get("defaults", {})
+    _normalize_entry_price(defaults)
     categories = []
     for cat in data.get("categories", []):
         merged = {**defaults, **{k: v for k, v in cat.items() if k != "slug"}}
         merged["slug"] = cat.get("slug", "")
+        _normalize_entry_price(merged)
         categories.append(merged)
     return {"defaults": defaults, "categories": categories}
+
+
+def _normalize_entry_price(params: dict) -> None:
+    """Ensure entry_price is always a list of ints (supports single int or list in JSON)."""
+    ep = params.get("entry_price")
+    if ep is None:
+        return
+    if isinstance(ep, (int, float)):
+        params["entry_price"] = [int(ep)]
+    elif isinstance(ep, list):
+        params["entry_price"] = [int(v) for v in ep]
 
 
 # ---------------------------------------------------------------------------

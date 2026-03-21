@@ -8,6 +8,7 @@ from your balance, and manages risk with a stop-loss.
 import logging
 import sys
 import time
+from datetime import datetime
 
 try:
     import colorama
@@ -45,17 +46,22 @@ C = {
     "yellow": _c("33"),
     "red": _c("31"),
     "cyan": _c("36"),
+    "gold": _c("38;5;220"),
 }
+
+
+def _timestamp() -> str:
+    return f"{C['gold']}{datetime.now().strftime('%-I:%M %p')}{C['reset']}"
 
 
 def _print_order_placed(ticker: str, count: int, price: int, order_id: str, dry_run: bool) -> None:
     prefix = f"{C['yellow']}[DRY RUN] " if dry_run else ""
-    print(f"{prefix}{C['green']}{C['bold']}BUY NO{C['reset']} {ticker} × {count} @ {price}¢  order_id={order_id}")
+    print(f"{_timestamp()} {prefix}{C['green']}{C['bold']}ORDER PLACED{C['reset']} {ticker} × {count} @ {price}¢  order_id={order_id}")
 
 
 def _print_order_sold(ticker: str, side: str, qty: int, price: int, order_id: str, dry_run: bool) -> None:
     prefix = f"{C['yellow']}[DRY RUN] " if dry_run else ""
-    print(f"{prefix}{C['red']}{C['bold']}SELL {side}{C['reset']} {ticker} × {qty} @ {price}¢  order_id={order_id}")
+    print(f"{_timestamp()} {prefix}{C['red']}{C['bold']}SOLD {side}{C['reset']} {ticker} × {qty} @ {price}¢  order_id={order_id}")
 
 
 def _print_balance_positions(balance: int, positions: list) -> None:
