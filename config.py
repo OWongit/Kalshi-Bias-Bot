@@ -11,7 +11,7 @@ from cryptography.hazmat.backends import default_backend
 # ---------------------------------------------------------------------------
 # API Credentials
 # ---------------------------------------------------------------------------
-API_KEY_ID = "YOUR_API_KEY_ID"
+API_KEY_ID = "b5375f0e-41a8-45cc-ae97-d9b6893b0481"
 
 # Path to your .key / .pem private key file (preferred over PRIVATE_KEY_STRING)
 PRIVATE_KEY_PATH = "private_key.pem"
@@ -33,7 +33,7 @@ MAX_PCT_PER_MARKET = 0.03       # Fraction of balance allocated per new market (
 MIN_CONTRACTS = 1               # Minimum contracts per order
 MAX_CONTRACTS = 10_000          # Maximum contracts per order
 
-STOP_LOSS_POLL_SECONDS =   0     # Sleep between main-loop iterations
+STOP_LOSS_POLL_SECONDS =   0.05     # Sleep between main-loop iterations
 DRY_RUN = False                  # True = log orders without sending them
 
 # ---------------------------------------------------------------------------
