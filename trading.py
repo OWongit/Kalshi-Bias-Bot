@@ -57,10 +57,10 @@ def build_no_candidates(
         no_bid = p.get("no_bid")
         if no_ask is None or no_bid is None:
             continue
-        entry_min = params.get("entry_price")
+        entry_prices = params.get("entry_price", [])
         max_spread = params.get("max_spread", 99)
         min_open_interest = params.get("min_open_interest")
-        if no_ask != entry_min:
+        if no_ask not in entry_prices:
             continue
         if no_ask - no_bid > max_spread:
             continue
@@ -176,9 +176,9 @@ def place_entry_orders(
         if no_ask is None or no_bid is None:
             log.warning("Missing bid/ask for %s on re-check; skipping", ticker)
             continue
-        entry_min = params.get("entry_price")
+        entry_prices = params.get("entry_price", [])
         max_spread = params.get("max_spread", 99)
-        if no_ask != entry_min:
+        if no_ask not in entry_prices:
             log.info("NO ask for %s moved to %s; skipping", ticker, no_ask)
             continue
         if no_ask - no_bid > max_spread:
