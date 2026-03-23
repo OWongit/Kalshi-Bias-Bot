@@ -23,7 +23,7 @@ from api_client import KalshiClient
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-START_DATE = "2026-3-21"     # Only include activity from this date onward (YYYY-MM-DD)
+START_DATE = "2026-3-19"     # Only include activity from this date onward (YYYY-MM-DD)
 OFFSET_DOLLARS = 0            # Shift the P&L baseline (e.g. initial deposit adjustment)
 OUTPUT_FILE = "performance.html"
 
@@ -160,10 +160,11 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
     For settlements: P&L = settlement revenue - total cost of contracts bought.
     For sells (before settlement): P&L = sell revenue - proportional buy cost.
     """
-    # Accumulate net cost and contract counts per ticker from fills
+    # Accumulate net cost, contract counts, and side per ticker from fills
     ticker_cost: dict[str, float] = defaultdict(float)  # total spent (cents)
     ticker_buy_count: dict[str, int] = defaultdict(int)  # total contracts bought
     ticker_sell_revenue: dict[str, float] = defaultdict(float)
+    ticker_side_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     for f in fills:
         ticker = f.get("ticker") or f.get("market_ticker") or ""
@@ -173,6 +174,8 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
         if action == "buy":
             ticker_cost[ticker] += price * count
             ticker_buy_count[ticker] += count
+            fill_side = f.get("side", "no")
+            ticker_side_counts[ticker][fill_side] += count
         elif action == "sell":
             ticker_sell_revenue[ticker] += price * count
 
@@ -198,6 +201,8 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
         pnl = revenue + sell_rev - cost
         settled_tickers.add(ticker)
 
+        sides = ticker_side_counts.get(ticker, {})
+        dominant_side = max(sides, key=sides.get) if sides else "no"
         events.append({
             "ts": ts,
             "ticker": ticker,
@@ -206,6 +211,7 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
             "pnl_cents": pnl,
             "cost_cents": cost,
             "buy_count": ticker_buy_count.get(ticker, 0),
+            "fill_side": dominant_side,
         })
 
     # For tickers with sells but no settlement yet, show realized sell P&L
@@ -220,6 +226,8 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
         count = _fill_count(f)
         ts = _parse_fill_ts(f)
         sell_cost = ticker_cost.get(ticker, 0)
+        sides = ticker_side_counts.get(ticker, {})
+        dominant_side = max(sides, key=sides.get) if sides else "no"
         events.append({
             "ts": ts,
             "ticker": ticker,
@@ -228,6 +236,7 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
             "pnl_cents": price * count,
             "cost_cents": sell_cost,
             "buy_count": ticker_buy_count.get(ticker, 0),
+            "fill_side": dominant_side,
         })
 
     events.sort(key=lambda e: e["ts"])
@@ -289,16 +298,47 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
     series_values = [s[1] for s in sorted_series]
     series_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in series_values]
 
+    # P&L by side (YES vs NO)
+    side_pnl: dict[str, float] = defaultdict(float)
+    side_trades: dict[str, int] = defaultdict(int)
+    side_wins: dict[str, int] = defaultdict(int)
+    for e in events:
+        if e["type"] != "settlement" or e.get("cost_cents", 0) <= 0 or e.get("pnl_cents", 0) == 0:
+            continue
+        fs = e.get("fill_side", "no").upper()
+        side_pnl[fs] += e["pnl_cents"] / 100
+        side_trades[fs] += 1
+        if e["pnl_cents"] > 0:
+            side_wins[fs] += 1
+    all_sides = sorted(side_pnl.keys())
+    if len(all_sides) >= 2:
+        avg_pnl = sum(side_pnl.values()) / len(all_sides)
+        if "BOTH" not in side_pnl:
+            side_pnl["BOTH"] = avg_pnl
+            all_sides = sorted(side_pnl.keys())
+    side_values = [side_pnl[s] for s in all_sides]
+    side_bar_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in side_values]
+    side_labels = []
+    for s in all_sides:
+        t = side_trades.get(s, 0)
+        w = side_wins.get(s, 0)
+        wr = (w / t * 100) if t > 0 else 0
+        if s == "BOTH":
+            side_labels.append(f"{s} (avg)")
+        else:
+            side_labels.append(f"{s} ({w}/{t}, {wr:.0f}%)")
+
     fig = make_subplots(
-        rows=4, cols=1,
+        rows=5, cols=1,
         subplot_titles=(
             "Cumulative P&L ($)",
             "Cumulative Return (%)",
             "Daily P&L ($)",
             "P&L by Series",
+            "P&L by Side",
         ),
-        vertical_spacing=0.06,
-        row_heights=[0.28, 0.22, 0.22, 0.28],
+        vertical_spacing=0.05,
+        row_heights=[0.23, 0.18, 0.18, 0.23, 0.18],
     )
 
     fig.add_trace(
@@ -351,13 +391,32 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
     )
     fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5, row=4, col=1)
 
+    fig.add_trace(
+        go.Bar(
+            x=side_labels, y=side_values,
+            marker_color=side_bar_colors,
+            name="Side P&L",
+        ),
+        row=5, col=1,
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=5, col=1)
+
     total_pnl = cumulative_pnl[-1] if cumulative_pnl else 0
-    settled_with_cost = [e for e in events if e["type"] == "settlement" and e.get("cost_cents", 0) > 0]
-    total_settlements = sum(1 for e in events if e["type"] == "settlement")
-    total_settled_cost = sum(e["cost_cents"] for e in settled_with_cost)
-    avg_total_cost = (total_settled_cost / len(settled_with_cost) / 100) if settled_with_cost else 0
+    trades = [e for e in events if e["type"] == "settlement" and e.get("cost_cents", 0) > 0 and e.get("pnl_cents", 0) != 0]
+    total_trades = len(trades)
+    total_trade_cost = sum(e["cost_cents"] for e in trades)
+    avg_total_cost = (total_trade_cost / total_trades / 100) if total_trades > 0 else 0
+
+    total_contracts = sum(e.get("buy_count", 0) for e in trades)
+    avg_contract_price = (total_trade_cost / total_contracts) if total_contracts > 0 else 0
+    expected_win_rate = avg_contract_price
+
+    wins = sum(1 for e in trades if e["pnl_cents"] > 0)
+    actual_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+
     pnl_color = "#2ecc71" if total_pnl >= 0 else "#e74c3c"
     pct_color = "#2ecc71" if last_pct >= 0 else "#e74c3c"
+    wr_color = "#2ecc71" if actual_win_rate >= expected_win_rate else "#e74c3c"
 
     fig.update_layout(
         title=dict(
@@ -366,11 +425,14 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
                 f"P&L: <span style='color:{pnl_color}'>${total_pnl:+,.2f}</span> | "
                 f"Return: <span style='color:{pct_color}'>{last_pct:+.2f}%</span> | "
                 f"Avg Cost: ${avg_total_cost:,.2f} | "
-                f"Settlements: {total_settlements}"
+                f"Trades: {total_trades}<br>"
+                f"Expected Win Rate: {expected_win_rate:.1f}% | "
+                f"Actual Win Rate: <span style='color:{wr_color}'>{actual_win_rate:.1f}%</span> "
+                f"({wins}/{total_trades})"
             ),
             font=dict(size=18),
         ),
-        height=1500,
+        height=1800,
         showlegend=False,
         template="plotly_dark",
         paper_bgcolor="#1a1a2e",
@@ -383,6 +445,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
     fig.update_yaxes(title_text="P&L ($)", row=3, col=1)
     fig.update_xaxes(title_text="P&L ($)", row=4, col=1)
     fig.update_yaxes(autorange="reversed", row=4, col=1)
+    fig.update_yaxes(title_text="P&L ($)", row=5, col=1)
 
     fig.write_html(output_file, include_plotlyjs="cdn")
     print(f"Dashboard saved to {output_file}")

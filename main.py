@@ -1,7 +1,7 @@
 """
-Kalshi Automated NO Trading Bot — main loop.
+Kalshi Automated Trading Bot — main loop.
 
-Discovers markets, opens NO positions under strict entry rules, sizes bets
+Discovers markets, opens positions under strict entry rules, sizes bets
 from your balance, and manages risk with a stop-loss.
 """
 
@@ -20,7 +20,7 @@ import config
 from api_client import KalshiClient
 from discovery import discover_all
 from trading import (
-    build_no_candidates,
+    build_candidates,
     compute_order_sizes,
     fetch_prices_batch,
     place_entry_orders,
@@ -46,7 +46,10 @@ C = {
     "yellow": _c("33"),
     "red": _c("31"),
     "cyan": _c("36"),
+    "magenta": _c("35"),
     "gold": _c("38;5;220"),
+    "neon_green": _c("92"),
+    "dim": _c("2"),
 }
 
 
@@ -54,14 +57,51 @@ def _timestamp() -> str:
     return f"{C['gold']}{datetime.now().strftime('%-I:%M %p')}{C['reset']}"
 
 
-def _print_order_placed(ticker: str, count: int, price: int, order_id: str, dry_run: bool) -> None:
+def _print_order_placed(ticker: str, count: int, price: int, order_id: str, side: str, dry_run: bool) -> None:
     prefix = f"{C['yellow']}[DRY RUN] " if dry_run else ""
-    print(f"{_timestamp()} {prefix}{C['green']}{C['bold']}ORDER PLACED{C['reset']} {ticker} × {count} @ {price}¢  order_id={order_id}")
+    print(f"{_timestamp()} {prefix}{C['green']}{C['bold']}BUY {side.upper()}{C['reset']} {ticker} × {count} @ {price}¢  order_id={order_id}")
 
 
 def _print_order_sold(ticker: str, side: str, qty: int, price: int, order_id: str, dry_run: bool) -> None:
     prefix = f"{C['yellow']}[DRY RUN] " if dry_run else ""
     print(f"{_timestamp()} {prefix}{C['red']}{C['bold']}SOLD {side}{C['reset']} {ticker} × {qty} @ {price}¢  order_id={order_id}")
+
+
+def _print_startup_banner(balance: int, positions: list) -> None:
+    cfg = config.load_categories_config(config.CATEGORIES_FILE)
+    categories = cfg["categories"]
+    defaults = cfg["defaults"]
+    open_pos = sum(1 for p in positions if p.get("position", 0) != 0)
+
+    bar = f"{C['neon_green']}{'═' * 60}{C['reset']}"
+    print()
+    print(bar)
+    print(f"{C['neon_green']}{C['bold']}  KALSHI BIAS BOT{C['reset']}")
+    print(bar)
+    print(f"  {C['cyan']}Balance:{C['reset']}  {C['bold']}${balance / 100:.2f}{C['reset']}  ({balance}¢)")
+    print(f"  {C['cyan']}Open positions:{C['reset']}  {C['bold']}{open_pos}{C['reset']}")
+    print(f"  {C['cyan']}Dry run:{C['reset']}  {C['yellow']}{config.DRY_RUN}{C['reset']}")
+    print()
+    print(f"  {C['magenta']}{C['bold']}Active Markets{C['reset']}")
+    print(f"  {C['dim']}{'─' * 56}{C['reset']}")
+    for cat in categories:
+        slug = cat.get("slug", "?")
+        side = cat.get("side", defaults.get("side", "no")).upper()
+        entry = cat.get("entry_price", defaults.get("entry_price", []))
+        spread = cat.get("max_spread", defaults.get("max_spread", 0))
+        oi = cat.get("min_open_interest", defaults.get("min_open_interest"))
+        oi_str = f"{oi:,}" if oi is not None else "off"
+        ep_str = ", ".join(str(e) for e in entry) if isinstance(entry, list) else str(entry)
+        side_color = C['green'] if side == "NO" else (C['yellow'] if side == "YES" else C['cyan'])
+        print(
+            f"  {C['gold']}{slug:14s}{C['reset']}  "
+            f"side={side_color}{C['bold']}{side:4s}{C['reset']}  "
+            f"entry=[{C['neon_green']}{ep_str}{C['reset']}]¢  "
+            f"spread≤{spread}¢  OI≥{oi_str}"
+        )
+    print(f"  {C['dim']}{'─' * 56}{C['reset']}")
+    print(bar)
+    print()
 
 
 def _print_balance_positions(balance: int, positions: list) -> None:
@@ -75,11 +115,14 @@ def main() -> None:
     client = KalshiClient(config.BASE_URL, config.API_KEY_ID, private_key)
 
     try:
-        client.get_balance()
+        balance = client.get_balance()
     except Exception as exc:
         print(f"{C['red']}{C['bold']}Authentication failed: {exc}{C['reset']}")
         print(f"{C['red']}Check API_KEY_ID, private key, and BASE_URL (demo vs production).{C['reset']}")
         sys.exit(1)
+
+    positions = client.get_positions()
+    _print_startup_banner(balance, positions)
 
     # ticker -> timestamp when cooldown expires
     cooldown_map: dict[str, float] = {}
@@ -135,10 +178,6 @@ def _run_iteration(
         log.warning("Failed to fetch open orders; using recently_placed only")
         open_orders = []
     tickers_with_open_orders: set[str] = {o.get("ticker", "") for o in open_orders if o.get("ticker")}
-    # Remove from recently_placed any ticker now confirmed in open_orders
-    recently_placed_tickers -= tickers_with_open_orders
-    # Exclude both open orders and recently placed (handles API lag)
-    tickers_with_open_orders = tickers_with_open_orders | recently_placed_tickers
 
     current_no_tickers: set[str] = set()
     current_yes_tickers: set[str] = set()
@@ -154,6 +193,16 @@ def _run_iteration(
             series = _extract_series(t)
             ticker_to_params[t] = series_to_params.get(series, defaults)
 
+    # Once the API reports a non-zero position, drop from recently_placed — position
+    # exclusion takes over. Do NOT remove recently_placed when only a resting order
+    # exists: if the order fills before get_positions updates, clearing recently_placed
+    # on "seen in open_orders" leaves a window where neither resting nor position
+    # blocks a second same-market order (duplicate ~2x size).
+    recently_placed_tickers -= current_no_tickers | current_yes_tickers
+
+    # Exclude open orders and tickers we just placed (handles get_orders / position lag)
+    tickers_with_open_orders = tickers_with_open_orders | recently_placed_tickers
+
     # 3. Fetch prices for all candidate + position tickers
     all_tickers = list(
         {t for t, _, _ in candidates}
@@ -168,8 +217,8 @@ def _run_iteration(
 
     active_cooldowns = set(cooldown_map.keys())
 
-    # 5. Build NO candidate list
-    qualified = build_no_candidates(
+    # 5. Build candidate list (YES, NO, or both per category config)
+    qualified = build_candidates(
         prices, candidates, active_cooldowns,
     )
 
@@ -185,10 +234,10 @@ def _run_iteration(
         client, orders_to_place, prices,
         config.DRY_RUN,
     )
-    for ticker, count, price, order_id in placed:
-        _print_order_placed(ticker, count, price, order_id, config.DRY_RUN)
+    for ticker, count, price, order_id, side in placed:
+        _print_order_placed(ticker, count, price, order_id, side, config.DRY_RUN)
     if placed:
-        recently_placed_tickers.update(ticker for ticker, _, _, _ in placed)
+        recently_placed_tickers.update(ticker for ticker, _, _, _, _ in placed)
         balance = client.get_balance()
         positions = client.get_positions()
         _print_balance_positions(balance, positions)

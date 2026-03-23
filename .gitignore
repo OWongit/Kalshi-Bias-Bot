@@ -3,3 +3,4 @@ my_config.py
 .venv
 private_key.pem
 calibration/past_data/
+calibration/sweep_results/

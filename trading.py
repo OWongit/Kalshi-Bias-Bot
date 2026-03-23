@@ -35,17 +35,46 @@ def fetch_prices_batch(
 # Entry filtering
 # ---------------------------------------------------------------------------
 
-def build_no_candidates(
+def _check_side_entry(
+    p: dict, entry_prices: list[int], max_spread: int,
+    min_open_interest: int | None, side: str,
+) -> int | None:
+    """Check if entry criteria are met for *side* on this market.
+
+    Returns the bid in cents if entry qualifies, else None.
+    """
+    if side == "no":
+        ask = p.get("no_ask")
+        bid = p.get("no_bid")
+    else:
+        ask = p.get("yes_ask")
+        bid = p.get("yes_bid")
+    if ask is None or bid is None:
+        return None
+    if ask not in entry_prices:
+        return None
+    if ask - bid > max_spread:
+        return None
+    if bid < 1 or bid >= 100:
+        return None
+    oi = p.get("open_interest", 0) or 0
+    if min_open_interest is not None and oi < min_open_interest:
+        return None
+    return bid
+
+
+def build_candidates(
     prices: dict[str, dict],
     candidates: list[tuple[str, str, dict]],
     cooldown_tickers: set[str],
-) -> list[tuple[str, str, int, dict]]:
-    """Filter candidates to those meeting the strict entry rule.
+) -> list[tuple[str, str, int, str, dict]]:
+    """Filter candidates to those meeting entry rules for their configured side.
 
     candidates: list of (ticker, event_ticker, params) with per-category params.
-    Returns [(ticker, event_ticker, no_bid, params)] for qualified markets.
+    params["side"] controls which side(s) to check: "yes", "no", or "both".
+    Returns [(ticker, event_ticker, bid, side, params)] for qualified markets.
     """
-    qualified: list[tuple[str, str, int, dict]] = []
+    qualified: list[tuple[str, str, int, str, dict]] = []
     for ticker, event_ticker, params in candidates:
         if ticker in cooldown_tickers:
             log.debug("Skip %s — in cooldown", ticker)
@@ -53,25 +82,23 @@ def build_no_candidates(
         p = prices.get(ticker)
         if p is None:
             continue
-        no_ask = p.get("no_ask")
-        no_bid = p.get("no_bid")
-        if no_ask is None or no_bid is None:
-            continue
         entry_prices = params.get("entry_price", [])
         max_spread = params.get("max_spread", 99)
         min_open_interest = params.get("min_open_interest")
-        if no_ask not in entry_prices:
-            continue
-        if no_ask - no_bid > max_spread:
-            continue
-        if no_bid < 1 or no_bid >= 100:
-            continue
-        oi = p.get("open_interest", 0) or 0
-        if min_open_interest is not None and oi < min_open_interest:
-            log.debug("Skip %s — open_interest %d < %d", ticker, oi, min_open_interest)
-            continue
-        qualified.append((ticker, event_ticker, no_bid, params))
-    log.info("%d candidates qualify for NO entry", len(qualified))
+        cfg_side = params.get("side", "no")
+
+        if cfg_side == "both":
+            sides_to_try = ["no", "yes"]
+        else:
+            sides_to_try = [cfg_side]
+
+        for s in sides_to_try:
+            bid = _check_side_entry(p, entry_prices, max_spread, min_open_interest, s)
+            if bid is not None:
+                qualified.append((ticker, event_ticker, bid, s, params))
+                break
+
+    log.info("%d candidates qualify for entry", len(qualified))
     return qualified
 
 
@@ -81,7 +108,7 @@ def build_no_candidates(
 
 def compute_order_sizes(
     balance_cents: int,
-    qualified: list[tuple[str, str, int, dict]],
+    qualified: list[tuple[str, str, int, str, dict]],
     current_no_tickers: set[str],
     current_yes_tickers: set[str],
     tickers_with_open_orders: set[str],
@@ -89,30 +116,30 @@ def compute_order_sizes(
     max_positions: int,
     min_contracts: int,
     max_contracts: int,
-) -> list[tuple[str, str, int, dict]]:
+) -> list[tuple[str, str, int, str, dict]]:
     """Decide how many contracts to buy for each qualified market.
 
     Skips markets that already have a position or an open order.
-    Returns [(ticker, event_ticker, count, params)].
+    Returns [(ticker, event_ticker, count, side, params)].
     """
     excluded = current_no_tickers | current_yes_tickers | tickers_with_open_orders
-    available_slots = max_positions - len(current_no_tickers)
+    available_slots = max_positions - len(current_no_tickers | current_yes_tickers)
     if available_slots <= 0:
         log.info("No open position slots (max %d reached)", max_positions)
         return []
 
-    orders: list[tuple[str, str, int, dict]] = []
-    for ticker, event_ticker, no_bid, params in qualified:
+    orders: list[tuple[str, str, int, str, dict]] = []
+    for ticker, event_ticker, bid, side, params in qualified:
         if len(orders) >= available_slots:
             break
         if ticker in excluded:
             continue
         allocation = balance_cents * max_pct
-        if no_bid <= 0:
+        if bid <= 0:
             continue
-        count = int(allocation // no_bid)
+        count = int(allocation // bid)
         count = max(min_contracts, min(max_contracts, count))
-        orders.append((ticker, event_ticker, count, params))
+        orders.append((ticker, event_ticker, count, side, params))
     log.info("Sized %d entry orders", len(orders))
     return orders
 
@@ -158,51 +185,58 @@ def _format_limit_price(
 
 def place_entry_orders(
     client,
-    orders_to_place: list[tuple[str, str, int, dict]],
+    orders_to_place: list[tuple[str, str, int, str, dict]],
     prices: dict[str, dict],
     dry_run: bool,
-) -> list[tuple[str, int, int | float, str]]:
-    """Place limit-buy NO orders for each entry, with a final re-check.
-    Uses no_price_dollars for deci-cent markets (0.1¢ above bid), else no_price (+1¢).
-    Returns [(ticker, count, price_cents_or_float, order_id), ...] for placed orders."""
-    placed: list[tuple[str, int, int | float, str]] = []
-    for ticker, event_ticker, count, params in orders_to_place:
+) -> list[tuple[str, int, int | float, str, str]]:
+    """Place limit-buy orders for each entry, with a final re-check.
+    Uses price_dollars for deci-cent markets (0.1¢ above bid), else price_cents (+1¢).
+    Returns [(ticker, count, price_cents_or_float, order_id, side), ...] for placed orders."""
+    placed: list[tuple[str, int, int | float, str, str]] = []
+    for ticker, event_ticker, count, side, params in orders_to_place:
         p = prices.get(ticker)
         if p is None:
             log.warning("No price data for %s on re-check; skipping", ticker)
             continue
-        no_ask = p.get("no_ask")
-        no_bid = p.get("no_bid")
-        if no_ask is None or no_bid is None:
+
+        if side == "no":
+            ask = p.get("no_ask")
+            bid = p.get("no_bid")
+            bid_dollars = p.get("no_bid_dollars")
+        else:
+            ask = p.get("yes_ask")
+            bid = p.get("yes_bid")
+            bid_dollars = p.get("yes_bid_dollars")
+
+        if ask is None or bid is None:
             log.warning("Missing bid/ask for %s on re-check; skipping", ticker)
             continue
         entry_prices = params.get("entry_price", [])
         max_spread = params.get("max_spread", 99)
-        if no_ask not in entry_prices:
-            log.info("NO ask for %s moved to %s; skipping", ticker, no_ask)
+        if ask not in entry_prices:
+            log.info("%s ask for %s moved to %s; skipping", side.upper(), ticker, ask)
             continue
-        if no_ask - no_bid > max_spread:
+        if ask - bid > max_spread:
             log.info("Spread widened for %s; skipping", ticker)
             continue
-        if no_bid < 1 or no_bid >= 100:
-            log.info("NO bid %s out of range for %s; skipping", no_bid, ticker)
+        if bid < 1 or bid >= 100:
+            log.info("%s bid %s out of range for %s; skipping", side.upper(), bid, ticker)
             continue
 
         structure = p.get("price_level_structure", "linear_cent")
-        no_bid_dollars = p.get("no_bid_dollars")
         price_cents, price_dollars, display_price = _format_limit_price(
-            no_bid, no_bid_dollars, structure, offset_deci_cents=True
+            bid, bid_dollars, structure, offset_deci_cents=True
         )
 
         if dry_run:
-            placed.append((ticker, count, display_price, "dry-run"))
+            placed.append((ticker, count, display_price, "dry-run", side))
             continue
 
         try:
             if price_dollars is not None:
                 order = client.create_order(
                     ticker=ticker,
-                    side="no",
+                    side=side,
                     action="buy",
                     count=count,
                     price_dollars=price_dollars,
@@ -210,12 +244,12 @@ def place_entry_orders(
             else:
                 order = client.create_order(
                     ticker=ticker,
-                    side="no",
+                    side=side,
                     action="buy",
                     count=count,
                     price_cents=price_cents,
                 )
-            placed.append((ticker, count, display_price, order.get("order_id", "?")))
+            placed.append((ticker, count, display_price, order.get("order_id", "?"), side))
         except Exception:
             log.exception("Failed to place order for %s", ticker)
         time.sleep(0.1)

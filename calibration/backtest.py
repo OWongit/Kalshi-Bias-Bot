@@ -1,6 +1,6 @@
 """
-Standalone backtest of the NO-entry / stop-loss strategy on historical
-candlestick CSVs.
+Standalone backtest of the entry / stop-loss strategy on historical
+candlestick CSVs.  Supports buying YES, NO, or both sides.
 
 Usage:
     python calibration/backtest.py calibration/past_data/KXNCAAMBGAME \
@@ -45,6 +45,41 @@ def load_candles(csv_path: str) -> list[dict]:
     return candles[:len(candles) -1] #remove the last row because it's incomplete.
 
 
+def _try_entry(candle: dict, entry_price: int, max_spread: int,
+               min_open_interest: int | None, side: str) -> int | None:
+    """Check if entry criteria are met for *side* on this candle.
+
+    Returns the entry cost (bid) in cents if entry qualifies, else None.
+    """
+    if side == "no":
+        yes_bid_close = candle.get("yes_bid_close")
+        yes_ask_close = candle.get("yes_ask_close")
+        if yes_bid_close is None or yes_ask_close is None:
+            return None
+        ask_close = 100 - yes_bid_close
+        bid_close = 100 - yes_ask_close
+    else:
+        ask_close = candle.get("yes_ask_close")
+        bid_close = candle.get("yes_bid_close")
+        if ask_close is None or bid_close is None:
+            return None
+
+    if ask_close != entry_price:
+        return None
+    if ask_close - bid_close > max_spread:
+        return None
+    if bid_close < 1 or bid_close >= 100:
+        return None
+    if min_open_interest is not None:
+        oi = candle.get("open_interest") or 0
+        if oi < min_open_interest:
+            return None
+    vol = candle.get("volume") or 0
+    if vol <= 0:
+        return None
+    return bid_close
+
+
 def simulate_market(
     candles: list[dict],
     result: str,
@@ -53,37 +88,35 @@ def simulate_market(
     max_spread: int,
     min_open_interest: int | None = None,
     cooldown_seconds: int = 0,
+    side: str = "no",
 ) -> list[dict]:
-    """Simulate the NO strategy on one market's candle series.
+    """Simulate the entry/stop-loss strategy on one market's candle series.
+
+    Args:
+        side: "yes", "no", or "both".  For "both", each candle checks NO
+              first, then YES; once holding, stop/settlement follows the
+              entered side.
 
     Returns a list of trade dicts, each with:
-        entry_cost, exit_price, pnl, exit_reason
+        entry_cost, exit_price, pnl, exit_reason, side
     """
     trades: list[dict] = []
     holding = False
     entry_cost = 0
+    entry_side = ""
     cooldown_until = 0
+
+    sides_to_check = ["no", "yes"] if side == "both" else [side]
 
     for candle in candles:
         ts = candle.get("end_period_ts") or 0
 
-        # Extract YES-side close prices and the YES ask high for the candle
         yes_bid_close = candle.get("yes_bid_close")
         yes_ask_close = candle.get("yes_ask_close")
-        yes_ask_high = candle.get("yes_ask_high")
-
-        # Skip candles with missing price data
         if yes_bid_close is None or yes_ask_close is None:
             continue
 
-        # Derive NO-side prices from YES-side (binary market identity):
-        #   no_bid = 100 - yes_ask  (best someone will pay for NO)
-        #   no_ask = 100 - yes_bid  (cheapest someone will sell NO)
-        no_bid_close = 100 - yes_ask_close
-        no_ask_close = 100 - yes_bid_close
-
         if holding:
-            # Only evaluate stop-loss on candles with actual trading activity
             vol = candle.get("volume") or 0
             if vol <= 0:
                 continue
@@ -92,71 +125,46 @@ def simulate_market(
                 if oi < min_open_interest:
                     continue
 
-            # Compute the worst (lowest) NO bid that occurred during this
-            # candle.  YES ask at its HIGH means NO bid was at its LOW.
-            if yes_ask_high is not None:
-                no_bid_low = 100 - yes_ask_high
+            if entry_side == "no":
+                yes_ask_high = candle.get("yes_ask_high")
+                bid_low = (100 - yes_ask_high) if yes_ask_high is not None else (100 - yes_ask_close)
             else:
-                no_bid_low = no_bid_close
+                yes_bid_low = candle.get("yes_bid_low")
+                bid_low = yes_bid_low if yes_bid_low is not None else yes_bid_close
 
-            # Stop-loss trigger: if the NO bid dipped to or below the
-            # threshold at any point during the candle, exit at the
-            # stop-loss price.  P/L = exit_price - entry_cost.
-            if no_bid_low <= stop_loss:
+            if stop_loss and bid_low <= stop_loss:
                 pnl = stop_loss - entry_cost
                 trades.append({
                     "entry_cost": entry_cost,
                     "exit_price": stop_loss,
                     "pnl": pnl,
                     "exit_reason": "stop_loss",
+                    "side": entry_side,
                 })
                 holding = False
                 cooldown_until = ts + cooldown_seconds
                 continue
         else:
-            # Skip entry while in cooldown after a stop-loss
             if ts < cooldown_until:
                 continue
-            # --- Entry check ---
-            # Require NO ask to exactly equal the configured entry price
-            if no_ask_close != entry_price:
-                continue
-            # Require the NO bid-ask spread to be tight enough
-            spread = no_ask_close - no_bid_close
-            if spread > max_spread:
-                continue
-            # Require the NO bid to be a valid order price (1-99 cents)
-            if no_bid_close < 1 or no_bid_close >= 100:
-                continue
-            # Require minimum open interest if configured
-            if min_open_interest is not None:
-                oi = candle.get("open_interest") or 0
-                if oi < min_open_interest:
-                    continue
-            # Skip candles with zero volume -- no counterparty to fill
-            vol = candle.get("volume") or 0
-            if vol <= 0:
-                continue
-            # Enter: place a maker limit buy at the NO bid
-            entry_cost = no_bid_close
-            holding = True
+            for s in sides_to_check:
+                cost = _try_entry(candle, entry_price, max_spread,
+                                  min_open_interest, s)
+                if cost is not None:
+                    entry_cost = cost
+                    entry_side = s
+                    holding = True
+                    break
 
-    # Settlement: if still holding when the market resolves, determine
-    # outcome from the market's result field.
     if holding:
-        # result == "no" means the NO side wins -> payout is 100¢ per contract
-        if result == "no":
-            pnl = 100 - entry_cost
-            exit_reason = "settlement_win"
-        # result == "yes" means the YES side wins -> NO contracts expire worthless
-        else:
-            pnl = 0 - entry_cost
-            exit_reason = "settlement_loss"
+        won = (result == entry_side)
+        pnl = (100 - entry_cost) if won else (0 - entry_cost)
         trades.append({
             "entry_cost": entry_cost,
-            "exit_price": 100 if result == "no" else 0,
+            "exit_price": 100 if won else 0,
             "pnl": pnl,
-            "exit_reason": exit_reason,
+            "exit_reason": "settlement_win" if won else "settlement_loss",
+            "side": entry_side,
         })
 
     return trades
@@ -246,6 +254,7 @@ def run_backtest(
     cooldown_seconds: int = 0,
     verbose: bool = False,
     ticker_filter: set[str] | None = None,
+    side: str = "no",
 ) -> dict:
     """Run the backtest over all markets in *data_dir*.
 
@@ -268,7 +277,7 @@ def run_backtest(
 
         trades = simulate_market(
             candles, meta.get("result", ""), entry_price, stop_loss, max_spread,
-            min_open_interest, cooldown_seconds,
+            min_open_interest, cooldown_seconds, side=side,
         )
 
         mkt_pnl = sum(t["pnl"] for t in trades)
@@ -329,18 +338,20 @@ def run_backtest_single(
     min_open_interest: int | None = None,
     cooldown_seconds: int = 0,
     verbose: bool = False,
+    side: str = "no",
 ) -> dict:
     """Run the backtest on a single market CSV file.
 
     Args:
         csv_path:    Path to a market candlestick CSV.
         result:      Settlement result for this market ("yes" or "no").
-        entry_price: NO ask must equal this to enter (cents).
-        stop_loss:   Sell when NO bid drops to this (cents).
-        max_spread:  Max NO bid-ask spread for entry (cents).
+        entry_price: Ask must equal this to enter (cents).
+        stop_loss:   Sell when bid drops to this (cents).
+        max_spread:  Max bid-ask spread for entry (cents).
         min_open_interest: Skip candles with open_interest below this (None = no filter).
         cooldown_seconds:  Seconds to wait after a stop-loss before re-entering.
         verbose:     Print per-trade details.
+        side:        "yes", "no", or "both".
 
     Returns a summary dict with stats for this single market.
     """
@@ -348,10 +359,8 @@ def run_backtest_single(
     ticker = os.path.splitext(os.path.basename(csv_path))[0]
 
     trades = simulate_market(candles, result, entry_price, stop_loss, max_spread,
-                             min_open_interest, cooldown_seconds)
+                             min_open_interest, cooldown_seconds, side=side)
 
-
-    print(trades)
     total_pnl = sum(t["pnl"] for t in trades)
     total_cost = sum(t["entry_cost"] for t in trades)
     wins = sum(1 for t in trades if t["pnl"] > 0)
@@ -360,11 +369,12 @@ def run_backtest_single(
     win_rate = (wins / len(trades) * 100) if trades else 0.0
 
     if verbose:
-        print(f"\nBacktest (single): {ticker}")
+        print(f"\nBacktest (single): {ticker}  side={side}")
         print(f"  Result: {result}  |  entry={entry_price}¢  "
               f"stop_loss={stop_loss}¢  max_spread={max_spread}¢\n")
         for j, t in enumerate(trades, 1):
-            print(f"  Trade {j}: buy @ {t['entry_cost']}¢  "
+            t_side = t.get('side', side)
+            print(f"  Trade {j}: {t_side.upper()} buy @ {t['entry_cost']}¢  "
                   f"exit @ {t['exit_price']}¢  pnl={t['pnl']:+d}¢  "
                   f"({t['exit_reason']})")
         print(f"\n  Total trades:   {len(trades)}")
@@ -394,11 +404,12 @@ def run_backtest_single(
 # Configuration — edit these values directly instead of using CLI args
 # ---------------------------------------------------------------------------
 DATA_DIR = "calibration/past_data/KXETH15M"
-ENTRY_PRICE = 95        # NO ask must equal this to enter (cents)
-STOP_LOSS = 0          # Sell when NO bid drops to this (cents)
-MAX_SPREAD = 1          # Max NO bid-ask spread for entry (cents)
+ENTRY_PRICE = 95        # Ask must equal this to enter (cents)
+STOP_LOSS = 0           # Sell when bid drops to this (cents, 0 = disabled)
+MAX_SPREAD = 1          # Max bid-ask spread for entry (cents)
 MIN_OPEN_INTEREST = None  # Skip candles with open_interest below this (None = no filter)
 COOLDOWN_SECONDS = 300  # Seconds to wait after a stop-loss before re-entering
+SIDE = "no"             # "yes", "no", or "both"
 
 # Set SINGLE_CSV to a file path to backtest just one market instead of the
 # whole directory.  Set to None to run the full directory backtest.
@@ -414,28 +425,30 @@ def main():
     max_spread = MAX_SPREAD
     min_oi = MIN_OPEN_INTEREST
     cooldown = COOLDOWN_SECONDS
+    side = SIDE
 
     if SINGLE_CSV:
         # Single-file mode
         run_backtest_single(
             SINGLE_CSV, SINGLE_RESULT, entry_price, stop_loss, max_spread,
-            min_oi, cooldown, verbose=True,
+            min_oi, cooldown, verbose=True, side=side,
         )
         return
 
     # Full directory mode
     data_dir = DATA_DIR
-    print(f"\nBacktest: entry={entry_price}¢  stop_loss={stop_loss}¢  "
+    print(f"\nBacktest: side={side}  entry={entry_price}¢  stop_loss={stop_loss}¢  "
           f"max_spread={max_spread}¢  min_open_interest={min_oi}  "
           f"cooldown={cooldown}s")
     print(f"Data dir: {data_dir}\n")
 
     summary = run_backtest(
         data_dir, entry_price, stop_loss, max_spread, min_oi, cooldown,
-        verbose=True,
+        verbose=True, side=side,
     )
 
     print(f"\n{'='*70}")
+    print(f"  Side:           {side}")
     print(f"  Total trades:   {summary['total_trades']}")
     print(f"  Total P/L:      {summary['total_pnl']:+d}¢ (${summary['total_pnl']/100:+.2f})")
     print(f"  Total cost:     {summary['total_cost']}¢ (${summary['total_cost']/100:.2f})")

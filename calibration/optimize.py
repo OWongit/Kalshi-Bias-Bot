@@ -46,21 +46,22 @@ C = {
 # ---------------------------------------------------------------------------
 DATA_DIR = "calibration/past_data/KXBTC15M"
 ENTRY_MIN = 95         # Lowest entry_price to test
-ENTRY_MAX = 95          # Highest entry_price to test 
+ENTRY_MAX = 99          # Highest entry_price to test 
 STOP_MIN = 0            # Lowest stop_loss to test
 STOP_MAX = 0            # Highest stop_loss to test
 # MAX_SPREAD_LIST = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-MAX_SPREAD_LIST = [5]  # Max NO bid-ask spread values to test (cents)
+MAX_SPREAD_LIST = [1]  # Max bid-ask spread values to test (cents)
 # MIN_OPEN_INTEREST_LIST = [None, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,]  # Open interest thresholds to test (None = no filter)
 MIN_OPEN_INTEREST_LIST = [1000]  # Open interest thresholds to test (None = no filter)
 COOLDOWN_SECONDS_LIST = [0]  # Cooldown values to test (seconds after stop-loss)
+SIDE_LIST = ["both"]  # Contract sides to test: "yes", "no", "both"
 TOP_N = 20              # Number of top results to display
 TOP_N_TO_TEST = 5      # Number of top configs to test on test set (when SETTING="both")
 RESULTS_DIR = "calibration/sweep_results"
 
 SETTING = "both"       # "training" | "testing" | "both"
 TRAIN_RATIO = 0.7      # Fraction of markets for training
-SPLIT_SEED = 45    # For reproducible random split
+SPLIT_SEED = 24    # For reproducible random split
 BEST_PARAMS_FILE = "calibration/sweep_results/best_params.json"
 
 
@@ -98,7 +99,8 @@ def _load_best_params(path: str, default_max_spread: int = 1) -> dict:
 
 def _save_best_params(path: str, entry_price: int, stop_loss: int,
                       cooldown_seconds: int, max_spread: int,
-                      min_open_interest: int | None = None) -> None:
+                      min_open_interest: int | None = None,
+                      side: str = "no") -> None:
     """Save best params to JSON file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -108,6 +110,7 @@ def _save_best_params(path: str, entry_price: int, stop_loss: int,
             "cooldown_seconds": cooldown_seconds,
             "max_spread": max_spread,
             "min_open_interest": min_open_interest,
+            "side": side,
         }, f, indent=2)
 
 
@@ -132,21 +135,22 @@ def _format_results_txt(results: list[dict], settings: dict, top: int,
     lines.append(f"  Max spread list:   {settings['max_spread_list']}¢")
     lines.append(f"  Min OI list:        {settings['min_oi_list']}")
     lines.append(f"  Cooldown values:    {settings['cooldown_list']}")
+    lines.append(f"  Side list:          {settings.get('side_list', ['no'])}")
     lines.append(f"  Combinations:       {completed}/{total}")
     lines.append("")
 
     sorted_results = sorted(results, key=lambda r: r["composite_score"], reverse=True)
 
-    lines.append(f"{'='*125}")
+    lines.append(f"{'='*135}")
     lines.append(f"  TOP {min(top, len(sorted_results))} PARAMETER COMBINATIONS (by composite score)")
-    lines.append(f"{'='*125}")
+    lines.append(f"{'='*135}")
     lines.append(
-        f"  {'Rank':>4s}  {'Entry':>5s}  {'Stop':>4s}  {'Cool':>5s}  {'Spread':>6s}  {'MinOI':>6s}  "
+        f"  {'Rank':>4s}  {'Side':>4s}  {'Entry':>5s}  {'Stop':>4s}  {'Cool':>5s}  {'Spread':>6s}  {'MinOI':>6s}  "
         f"{'Composite':>9s}  {'Return%':>7s}  {'95% CI':>14s}  {'Sharpe':>6s}  {'t-Stat':>6s}  "
         f"{'P/L':>8s}  {'Cost':>8s}  {'Trades':>6s}  {'WinRate':>7s}"
     )
     lines.append(
-        f"  {'-'*4:>4s}  {'-'*5:>5s}  {'-'*4:>4s}  {'-'*5:>5s}  {'-'*6:>6s}  {'-'*6:>6s}  "
+        f"  {'-'*4:>4s}  {'-'*4:>4s}  {'-'*5:>5s}  {'-'*4:>4s}  {'-'*5:>5s}  {'-'*6:>6s}  {'-'*6:>6s}  "
         f"{'-'*9:>9s}  {'-'*7:>7s}  {'-'*14:>14s}  {'-'*6:>6s}  {'-'*6:>6s}  "
         f"{'-'*8:>8s}  {'-'*8:>8s}  {'-'*6:>6s}  {'-'*7:>7s}"
     )
@@ -156,15 +160,16 @@ def _format_results_txt(results: list[dict], settings: dict, top: int,
         ci_str = f"[{ci[0]:+.1f},{ci[1]:+.1f}]"
         moi = r.get("min_open_interest")
         moi_str = f"{moi:6d}" if moi is not None else "  None"
+        side_str = r.get("side", "no")
         lines.append(
-            f"  {rank:4d}  {r['entry_price']:5d}¢ {r['stop_loss']:4d}¢ "
+            f"  {rank:4d}  {side_str:>4s}  {r['entry_price']:5d}¢ {r['stop_loss']:4d}¢ "
             f" {r['cooldown_seconds']:4d}s  {r['max_spread']:5d}¢  {moi_str}  {r['composite_score']:9.2f}  "
             f"{r['pct_return']:+6.2f}%  {ci_str:>14s}  {r['sharpe_like']:6.2f}  {r['t_stat']:6.2f}  "
             f"{r['total_pnl']:+7d}¢  {r['total_cost']:7d}¢  {r['total_trades']:6d}  "
             f"{r['win_rate']:6.1f}%"
         )
 
-    lines.append(f"{'='*125}")
+    lines.append(f"{'='*135}")
     lines.append("")
     return "\n".join(lines)
 
@@ -194,17 +199,17 @@ def _run_training(data_dir: str, train_tickers: set[str], settings: dict,
 
     atexit.register(_dump_on_exit)
 
-    print(f"{C['cyan']}{C['bold']}Sweeping {total} (entry_price, stop_loss, cooldown, max_spread, min_oi) combinations on TRAIN split{C['reset']} …")
+    print(f"{C['cyan']}{C['bold']}Sweeping {total} (entry_price, stop_loss, cooldown, max_spread, min_oi, side) combinations on TRAIN split{C['reset']} …")
     print(f"  Data dir:   {data_dir}")
     print(f"  Train markets: {len(train_tickers)}")
     print(f"  Max spread list: {settings['max_spread_list']}¢  min_oi_list: {settings['min_oi_list']}  "
-          f"cooldown: {settings['cooldown_list']}\n")
+          f"cooldown: {settings['cooldown_list']}  side: {settings.get('side_list', ['no'])}\n")
 
     bar_width = 40
-    for i, (entry_price, stop_loss, cooldown, max_spread, min_oi) in enumerate(combos, 1):
+    for i, (entry_price, stop_loss, cooldown, max_spread, min_oi, side) in enumerate(combos, 1):
         summary = run_backtest(
             data_dir, entry_price, stop_loss, max_spread, min_oi, cooldown,
-            ticker_filter=train_tickers,
+            ticker_filter=train_tickers, side=side,
         )
         results.append({
             "entry_price": entry_price,
@@ -212,6 +217,7 @@ def _run_training(data_dir: str, train_tickers: set[str], settings: dict,
             "cooldown_seconds": cooldown,
             "max_spread": max_spread,
             "min_open_interest": min_oi,
+            "side": side,
             "pct_return": summary["pct_return"],
             "pct_return_ci_95": summary.get("pct_return_ci_95", (0.0, 0.0)),
             "total_pnl": summary["total_pnl"],
@@ -233,7 +239,7 @@ def _run_training(data_dir: str, train_tickers: set[str], settings: dict,
         score_color = C['green'] if score > 0 else (C['red'] if score < 0 else "")
         print(
             f"\r  [{bar}] {C['cyan']}{pct:6.1%}{C['reset']}  ({i}/{total})  "
-            f"entry={entry_price} stop={stop_loss} cool={cooldown}s spread={max_spread}¢ "
+            f"side={side} entry={entry_price} stop={stop_loss} cool={cooldown}s spread={max_spread}¢ "
             f"-> composite={score_color}{score:.2f}{C['reset']}",
             end="", flush=True,
         )
@@ -248,9 +254,10 @@ def _run_training(data_dir: str, train_tickers: set[str], settings: dict,
         best["cooldown_seconds"],
         best["max_spread"],
         best.get("min_open_interest"),
+        best.get("side", "no"),
     )
     print(f"{C['green']}{C['bold']}Best params saved{C['reset']} to {best_params_file}: "
-          f"entry={best['entry_price']}¢ stop={best['stop_loss']}¢ "
+          f"side={best.get('side', 'no')} entry={best['entry_price']}¢ stop={best['stop_loss']}¢ "
           f"cooldown={best['cooldown_seconds']}s spread={best['max_spread']}¢ "
           f"min_oi={best.get('min_open_interest')}")
 
@@ -295,17 +302,17 @@ def _fmt_tstat(val: float) -> str:
 
 def _print_results_table(results: list[dict], top: int, title: str) -> None:
     """Print the top-N results table."""
-    sep = f"{C['dim']}{'='*125}{C['reset']}"
+    sep = f"{C['dim']}{'='*135}{C['reset']}"
     print(f"\n{sep}")
     print(f"  {C['cyan']}{C['bold']}{title}{C['reset']}")
     print(sep)
     print(
-        f"  {C['bold']}{'Rank':>4s}  {'Entry':>5s}  {'Stop':>4s}  {'Cool':>5s}  {'Spread':>6s}  {'MinOI':>6s}  "
+        f"  {C['bold']}{'Rank':>4s}  {'Side':>4s}  {'Entry':>5s}  {'Stop':>4s}  {'Cool':>5s}  {'Spread':>6s}  {'MinOI':>6s}  "
         f"{'Composite':>9s}  {'Return%':>7s}  {'95% CI':>14s}  {'Sharpe':>6s}  {'t-Stat':>6s}  {'P/L':>8s}  "
         f"{'Cost':>8s}  {'Trades':>6s}  {'WinRate':>7s}{C['reset']}"
     )
     print(
-        f"  {C['dim']}{'-'*4:>4s}  {'-'*5:>5s}  {'-'*4:>4s}  {'-'*5:>5s}  {'-'*6:>6s}  {'-'*6:>6s}  "
+        f"  {C['dim']}{'-'*4:>4s}  {'-'*4:>4s}  {'-'*5:>5s}  {'-'*4:>4s}  {'-'*5:>5s}  {'-'*6:>6s}  {'-'*6:>6s}  "
         f"{'-'*9:>9s}  {'-'*7:>7s}  {'-'*14:>14s}  {'-'*6:>6s}  {'-'*6:>6s}  {'-'*8:>8s}  "
         f"{'-'*8:>8s}  {'-'*6:>6s}  {'-'*7:>7s}{C['reset']}"
     )
@@ -320,8 +327,9 @@ def _print_results_table(results: list[dict], top: int, title: str) -> None:
         max_spread = r.get("max_spread", 0)
         moi = r.get("min_open_interest")
         moi_str = f"{moi:6d}" if moi is not None else "  None"
+        side_str = r.get("side", "no")
         print(
-            f"  {rank_style}{rank:4d}{rank_reset}  {r['entry_price']:5d}¢ {r['stop_loss']:4d}¢ "
+            f"  {rank_style}{rank:4d}{rank_reset}  {side_str:>4s}  {r['entry_price']:5d}¢ {r['stop_loss']:4d}¢ "
             f" {r['cooldown_seconds']:4d}s  {max_spread:5d}¢  {moi_str}  {comp_color}{r['composite_score']:9.2f}{C['reset']}  "
             f"{_fmt_num(r['pct_return'], suffix='%')}  {ci_str}  {sharpe_str}  {tstat_str}  "
             f"{_fmt_num(r['total_pnl'], '+7d', suffix='¢')}  {r['total_cost']:7d}¢  {r['total_trades']:6d}  "
@@ -339,6 +347,7 @@ def main():
     max_spread_list = MAX_SPREAD_LIST
     min_oi_list = MIN_OPEN_INTEREST_LIST
     cooldown_list = COOLDOWN_SECONDS_LIST
+    side_list = SIDE_LIST
     top = TOP_N
     top_n_to_test = TOP_N_TO_TEST
     results_dir = RESULTS_DIR
@@ -363,18 +372,20 @@ def main():
         "max_spread_list": max_spread_list,
         "min_oi_list": min_oi_list,
         "cooldown_list": cooldown_list,
+        "side_list": side_list,
         "timestamp": timestamp,
         "train_markets": len(train_tickers),
         "test_markets": len(test_tickers),
     }
 
     combos = [
-        (ep, sl, cd, ms, moi)
+        (ep, sl, cd, ms, moi, sd)
         for ep in range(entry_min, entry_max + 1)
         for sl in range(stop_min, stop_max + 1)
         for cd in cooldown_list
         for ms in max_spread_list
         for moi in min_oi_list
+        for sd in side_list
         if sl < ep
     ]
 
@@ -388,6 +399,7 @@ def main():
     if setting == "testing":
         params = _load_best_params(best_params_file, default_max_spread=max_spread_list[0] if max_spread_list else 1)
         test_min_oi = params.get("min_open_interest")
+        test_side = params.get("side", "no")
         print(f"{C['cyan']}{C['bold']}Testing best params on TEST split{C['reset']} ({len(test_tickers)} markets)\n")
         summary = run_backtest(
             data_dir,
@@ -397,9 +409,10 @@ def main():
             test_min_oi,
             params["cooldown_seconds"],
             ticker_filter=test_tickers,
+            side=test_side,
         )
         test_results = [{**summary, "cooldown_seconds": params["cooldown_seconds"], "max_spread": params["max_spread"],
-                         "min_open_interest": test_min_oi}]
+                         "min_open_interest": test_min_oi, "side": test_side}]
         _print_results_table(
             test_results, 1,
             "TEST PERFORMANCE (best params from training)",
@@ -422,7 +435,7 @@ def main():
     sweep_csv = os.path.join(results_dir, f"{slug}_{timestamp}_train.csv")
     os.makedirs(results_dir, exist_ok=True)
     fieldnames = [
-        "entry_price", "stop_loss", "cooldown_seconds", "max_spread", "min_open_interest", "pct_return",
+        "side", "entry_price", "stop_loss", "cooldown_seconds", "max_spread", "min_open_interest", "pct_return",
         "pct_return_ci_low", "pct_return_ci_high", "median_return",
         "pct_profitable_markets", "sharpe_like", "t_stat", "composite_score",
         "total_pnl", "total_cost", "total_trades", "win_rate",
@@ -442,6 +455,7 @@ def main():
         print(f"\n{C['magenta']}--- Test performance of top {n_to_test} configs ---{C['reset']}\n")
         test_results = []
         for r in results[:n_to_test]:
+            r_side = r.get("side", "no")
             summary = run_backtest(
                 data_dir,
                 r["entry_price"],
@@ -450,9 +464,10 @@ def main():
                 r.get("min_open_interest"),
                 r["cooldown_seconds"],
                 ticker_filter=test_tickers,
+                side=r_side,
             )
             test_results.append({**summary, "cooldown_seconds": r["cooldown_seconds"], "max_spread": r["max_spread"],
-                                 "min_open_interest": r.get("min_open_interest")})
+                                 "min_open_interest": r.get("min_open_interest"), "side": r_side})
         _print_results_table(
             test_results, n_to_test,
             f"TEST PERFORMANCE (top {n_to_test} from training)",
