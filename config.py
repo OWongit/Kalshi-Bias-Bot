@@ -11,7 +11,7 @@ from cryptography.hazmat.backends import default_backend
 # ---------------------------------------------------------------------------
 # API Credentials
 # ---------------------------------------------------------------------------
-API_KEY_ID = "b5375f0e-41a8-45cc-ae97-d9b6893b0481"
+API_KEY_ID = "3d22afbd-0c39-4cb7-bde0-d48c81062ce5"
 
 # Path to your .key / .pem private key file (preferred over PRIVATE_KEY_STRING)
 PRIVATE_KEY_PATH = "private_key.pem"
@@ -23,7 +23,7 @@ PRIVATE_KEY_STRING = ""
 # ---------------------------------------------------------------------------
 # Environment
 # ---------------------------------------------------------------------------
-BASE_URL = "https://api.elections.kalshi.com"
+BASE_URL = "https://demo-api.kalshi.co"
 
 # ---------------------------------------------------------------------------
 # Trading Parameters (global fallbacks; per-category overrides in categories.json)

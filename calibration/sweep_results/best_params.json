@@ -1,8 +1,8 @@
 {
-  "entry_price": 99,
+  "entry_price": 92,
   "stop_loss": 0,
   "cooldown_seconds": 0,
-  "max_spread": 1,
-  "min_open_interest": 1000,
-  "side": "both"
+  "max_spread": 5,
+  "min_open_interest": 8000,
+  "side": "no"
 }

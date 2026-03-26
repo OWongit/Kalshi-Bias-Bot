@@ -9,11 +9,15 @@ Usage:
     python performance.py
 """
 
+import csv
 import sys
 import time
+import math
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
+from zoneinfo import ZoneInfo
 
+import plotly.colors as plc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
@@ -23,9 +27,37 @@ from api_client import KalshiClient
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-START_DATE = "2026-3-19"     # Only include activity from this date onward (YYYY-MM-DD)
+START_DATE = "2026-3-19"      # Only include activity from this date onward (YYYY-MM-DD)
 OFFSET_DOLLARS = 0            # Shift the P&L baseline (e.g. initial deposit adjustment)
+PORTFOLIO_ALLOCATION = 0.10   # The % of your account allocated per trade (0.10 = 10%)
 OUTPUT_FILE = "performance.html"
+EVENTS_CSV_FILE = "performance_events.csv"
+# Local timezone for chart times, daily P&L buckets, and hourly frequency (IANA).
+# Must match your wall clock (e.g. America/Los_Angeles if times were ~7h ahead of Pacific).
+HOURLY_FREQUENCY_TIMEZONE = "America/Los_Angeles"
+
+
+def _resolve_display_timezone() -> tuple[tzinfo, str]:
+    """IANA zones need the ``tzdata`` package on Windows. Fallback: UTC."""
+    key = HOURLY_FREQUENCY_TIMEZONE.strip()
+    if key.upper() == "UTC":
+        return timezone.utc, "UTC"
+    try:
+        return ZoneInfo(key), key
+    except Exception:
+        print(
+            f"Warning: Could not load timezone {key!r} (install: pip install tzdata). "
+            "Using UTC for all chart times.",
+            file=sys.stderr,
+        )
+        return timezone.utc, "UTC"
+
+
+def _ts_for_display(ts: datetime, tz: tzinfo) -> datetime:
+    """Kalshi timestamps are UTC; convert for plotting and calendar-day grouping."""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(tz)
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +118,18 @@ def fetch_all_settlements(client: KalshiClient, min_ts: int) -> list[dict]:
         if (h.get("ticker"), h.get("settled_time")) not in seen:
             live.append(h)
     return live
+
+
+def fetch_portfolio_balance(client: KalshiClient) -> float:
+    """Fetch the current portfolio balance from Kalshi in dollars."""
+    try:
+        res = client.get("/portfolio/balance")
+        if "balance" in res:
+            return float(res["balance"]) / 100.0
+        return 100.0  # Fallback
+    except Exception as e:
+        print(f"Warning: Failed to fetch balance, defaulting to $100.0 ({e})")
+        return 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -155,12 +199,7 @@ def _parse_settlement_ts(s: dict) -> datetime:
 
 
 def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
-    """Build realized P&L events: one entry per settled market or sell fill.
-
-    For settlements: P&L = settlement revenue - total cost of contracts bought.
-    For sells (before settlement): P&L = sell revenue - proportional buy cost.
-    """
-    # Accumulate net cost, contract counts, and side per ticker from fills
+    """Build realized P&L events: one entry per settled market or sell fill."""
     ticker_cost: dict[str, float] = defaultdict(float)  # total spent (cents)
     ticker_buy_count: dict[str, int] = defaultdict(int)  # total contracts bought
     ticker_sell_revenue: dict[str, float] = defaultdict(float)
@@ -181,7 +220,6 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
 
     events: list[dict] = []
 
-    # Settlement events: realized P&L = revenue + sell proceeds - buy cost
     settled_tickers: set[str] = set()
     for s in settlements:
         ticker = s.get("ticker", "")
@@ -214,7 +252,6 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
             "fill_side": dominant_side,
         })
 
-    # For tickers with sells but no settlement yet, show realized sell P&L
     for f in fills:
         ticker = f.get("ticker") or f.get("market_ticker") or ""
         if ticker in settled_tickers:
@@ -243,36 +280,71 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
     return events
 
 
+def write_events_csv(events: list[dict], path: str) -> None:
+    display_tz, _ = _resolve_display_timezone()
+    rows = [e for e in events if int(e.get("buy_count") or 0) != 0]
+    if rows:
+        keys: set[str] = set()
+        for e in rows:
+            keys |= e.keys()
+        keys.discard("ts")
+        fieldnames = ["ts_utc", "ts_local"] + sorted(keys)
+    else:
+        fieldnames = [
+            "ts_utc",
+            "ts_local",
+            "ticker",
+            "series",
+            "type",
+            "pnl_cents",
+            "cost_cents",
+            "buy_count",
+            "fill_side",
+        ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for e in rows:
+            ts = e["ts"]
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            row: dict[str, object] = {
+                "ts_utc": ts.astimezone(timezone.utc).isoformat(),
+                "ts_local": _ts_for_display(ts, display_tz).isoformat(),
+            }
+            for k in fieldnames[2:]:
+                row[k] = e.get(k, "")
+            w.writerow(row)
+    print(f"Events CSV saved to {path} ({len(rows)} rows, buy_count != 0)")
+
+
 # ---------------------------------------------------------------------------
 # Chart building
 # ---------------------------------------------------------------------------
 
-def build_dashboard(events: list[dict], offset_dollars: float, output_file: str) -> None:
+def build_dashboard(events: list[dict], offset_dollars: float, current_balance: float, alloc_pct: float, output_file: str) -> None:
     if not events:
         print("No data to plot.")
         sys.exit(0)
 
-    # Cumulative P&L timeline (only realized profit/loss)
+    display_tz, display_tz_label = _resolve_display_timezone()
+
     timestamps = []
     cumulative_pnl = []
-    running = offset_dollars * 100  # cents
+    running = offset_dollars * 100 
     for e in events:
         running += e["pnl_cents"]
-        timestamps.append(e["ts"])
+        timestamps.append(_ts_for_display(e["ts"], display_tz))
         cumulative_pnl.append(running / 100)
 
-    # Daily P&L
     daily_pnl: dict[str, float] = defaultdict(float)
     for e in events:
-        day = e["ts"].strftime("%Y-%m-%d")
+        day = _ts_for_display(e["ts"], display_tz).strftime("%Y-%m-%d")
         daily_pnl[day] += e["pnl_cents"] / 100
     daily_dates = sorted(daily_pnl.keys())
     daily_values = [daily_pnl[d] for d in daily_dates]
     daily_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in daily_values]
 
-    # Cumulative percent return: total P&L / avg total cost per market
-    # avg total cost = total capital spent / number of markets with cost > 0
-    # Result is a ratio displayed as %, e.g. 5.78 / 3.28 = 176%
     pct_timestamps = []
     pct_values = []
     running_pnl_for_pct = 0.0
@@ -284,61 +356,180 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
         running_cost_for_pct += cost
         if cost > 0:
             markets_with_cost += 1
-        pct_timestamps.append(e["ts"])
+        pct_timestamps.append(_ts_for_display(e["ts"], display_tz))
         avg_cost = (running_cost_for_pct / markets_with_cost) if markets_with_cost > 0 else 0
         pct = (running_pnl_for_pct / avg_cost * 100) if avg_cost > 0 else 0.0
         pct_values.append(pct)
 
-    # P&L by series
-    series_pnl: dict[str, float] = defaultdict(float)
+    series_trades: dict[str, int] = defaultdict(int)
+    series_wins: dict[str, int] = defaultdict(int)
     for e in events:
-        series_pnl[e["series"]] += e["pnl_cents"] / 100
-    sorted_series = sorted(series_pnl.items(), key=lambda x: x[1], reverse=True)
+        if e["type"] != "settlement" or e.get("cost_cents", 0) <= 0 or e.get("pnl_cents", 0) == 0:
+            continue
+        series_trades[e["series"]] += 1
+        if e["pnl_cents"] > 0:
+            series_wins[e["series"]] += 1
+
+    series_win_rates = {}
+    for s, t in series_trades.items():
+        series_win_rates[s] = (series_wins[s] / t * 100) if t > 0 else 0
+
+    sorted_series = sorted(series_win_rates.items(), key=lambda x: x[1], reverse=True)
     series_names = [s[0] for s in sorted_series]
     series_values = [s[1] for s in sorted_series]
-    series_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in series_values]
+    series_trade_counts = [series_trades[s] for s in series_names]
+    series_won_counts = [series_wins[s] for s in series_names]
+    series_bar_colors = ["#2ecc71" if v >= 50 else "#e74c3c" for v in series_values]
 
-    # P&L by side (YES vs NO)
-    side_pnl: dict[str, float] = defaultdict(float)
+    series_market_expected_wrs: dict[str, list[float]] = defaultdict(list)
+    for e in events:
+        if e["type"] == "settlement" and e.get("cost_cents", 0) > 0 and e.get("pnl_cents", 0) != 0:
+            if e.get("buy_count", 0) > 0:
+                expected_wr = e["cost_cents"] / e["buy_count"]
+                series_market_expected_wrs[e["series"]].append(expected_wr)
+
+    series_expected_values = []
+    for s in series_names:
+        wrs = series_market_expected_wrs.get(s, [])
+        avg_exp = sum(wrs) / len(wrs) if wrs else 0
+        series_expected_values.append(avg_exp)
+
     side_trades: dict[str, int] = defaultdict(int)
     side_wins: dict[str, int] = defaultdict(int)
     for e in events:
         if e["type"] != "settlement" or e.get("cost_cents", 0) <= 0 or e.get("pnl_cents", 0) == 0:
             continue
         fs = e.get("fill_side", "no").upper()
-        side_pnl[fs] += e["pnl_cents"] / 100
         side_trades[fs] += 1
         if e["pnl_cents"] > 0:
             side_wins[fs] += 1
-    all_sides = sorted(side_pnl.keys())
+
+    all_sides = sorted(side_trades.keys())
+    side_win_rates = {}
+    for s in all_sides:
+        t = side_trades[s]
+        side_win_rates[s] = (side_wins[s] / t * 100) if t > 0 else 0
+
     if len(all_sides) >= 2:
-        avg_pnl = sum(side_pnl.values()) / len(all_sides)
-        if "BOTH" not in side_pnl:
-            side_pnl["BOTH"] = avg_pnl
-            all_sides = sorted(side_pnl.keys())
-    side_values = [side_pnl[s] for s in all_sides]
-    side_bar_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in side_values]
+        total_t = sum(side_trades.values())
+        total_w = sum(side_wins.values())
+        overall_wr = (total_w / total_t * 100) if total_t > 0 else 0
+        side_win_rates["BOTH (avg)"] = overall_wr
+        all_sides.append("BOTH (avg)")
+
+    side_values = [side_win_rates[s] for s in all_sides]
+    side_bar_colors = ["#2ecc71" if v >= 50 else "#e74c3c" for v in side_values]
+    
     side_labels = []
     for s in all_sides:
-        t = side_trades.get(s, 0)
-        w = side_wins.get(s, 0)
-        wr = (w / t * 100) if t > 0 else 0
-        if s == "BOTH":
-            side_labels.append(f"{s} (avg)")
+        if s == "BOTH (avg)":
+            side_labels.append(s)
         else:
-            side_labels.append(f"{s} ({w}/{t}, {wr:.0f}%)")
+            t = side_trades.get(s, 0)
+            w = side_wins.get(s, 0)
+            side_labels.append(f"{s} ({w}/{t})")
 
+    hour_series_count: dict[tuple[int, str], int] = defaultdict(int)
+    series_in_trades: set[str] = set()
+    for e in events:
+        if e["type"] != "settlement" or e.get("cost_cents", 0) <= 0 or e.get("pnl_cents", 0) == 0:
+            continue
+        local_ts = _ts_for_display(e["ts"], display_tz)
+        hour_series_count[(local_ts.hour, e["series"])] += 1
+        series_in_trades.add(e["series"])
+    hours = list(range(24))
+    hour_labels = [f"{h:02d}:00" for h in hours]
+    sorted_trade_series = sorted(series_in_trades)
+    palette = plc.qualitative.Bold + plc.qualitative.Dark24 + plc.qualitative.Set2
+    hourly_series_colors = {s: palette[i % len(palette)] for i, s in enumerate(sorted_trade_series)}
+
+    # -----------------------------------------------------------------------
+    # Calculate Trade Returns & Intervals for Account Projection
+    # -----------------------------------------------------------------------
+    valid_trades = [e for e in events if e.get("cost_cents", 0) > 0 and e.get("type") == "settlement"]
+    
+    total_trade_return_pct = 0.0
+    avg_trade_return_pct = 0.0
+    hourly_gain = 0.0
+    daily_gain = 0.0
+    weekly_gain = 0.0
+
+    proj_hours = 30 * 24
+    x_proj_days = list(h / 24.0 for h in range(proj_hours + 1))
+    center_proj = [current_balance for _ in x_proj_days]
+    upper_proj = [current_balance for _ in x_proj_days]
+    lower_proj = [current_balance for _ in x_proj_days]
+
+    if valid_trades:
+        # Sum total
+        returns = [(e["pnl_cents"] / e["cost_cents"]) * 100 for e in valid_trades]
+        total_trade_return_pct = sum(returns)
+        avg_trade_return_pct = total_trade_return_pct / len(valid_trades)
+
+        # Total timespan
+        start_ts = min(e["ts"] for e in events)
+        end_ts = max(e["ts"] for e in events)
+        total_seconds = (end_ts - start_ts).total_seconds()
+        total_hours = max(1.0, total_seconds / 3600.0)
+        
+        # Calculate timeframe gains
+        hourly_gain = total_trade_return_pct / total_hours
+        daily_gain = hourly_gain * 24
+        weekly_gain = hourly_gain * 168
+
+        # --- Calculate Variance and Projection Paths ---
+        # Group into integer hourly buckets to calculate std deviation
+        hourly_buckets = defaultdict(float)
+        for e in valid_trades:
+            idx = int((e["ts"] - start_ts).total_seconds() / 3600.0)
+            ret = (e["pnl_cents"] / e["cost_cents"]) * 100
+            hourly_buckets[idx] += ret
+            
+        sum_sq = sum(val**2 for val in hourly_buckets.values())
+        variance = (sum_sq / total_hours) - (hourly_gain**2)
+        variance = max(0, variance) # prevent floating point negatives
+        sigma_hourly = math.sqrt(variance)
+
+        # Adjust by Portfolio Allocation fraction
+        mu_alloc = (hourly_gain / 100.0) * alloc_pct
+        sigma_alloc = (sigma_hourly / 100.0) * alloc_pct
+
+        # Apply Geometric Brownian Motion logic for exp compounding
+        if 1 + mu_alloc > 0:
+            m = math.log(1 + mu_alloc) - (sigma_alloc**2) / 2.0
+        else:
+            m = 0
+            
+        center_proj = []
+        upper_proj = []
+        lower_proj = []
+        
+        for h in range(proj_hours + 1):
+            center_val = current_balance * math.exp((m + (sigma_alloc**2)/2.0) * h)
+            upper_val = current_balance * math.exp(m * h + 2.0 * sigma_alloc * math.sqrt(h))
+            lower_val = current_balance * math.exp(m * h - 2.0 * sigma_alloc * math.sqrt(h))
+            
+            center_proj.append(center_val)
+            upper_proj.append(upper_val)
+            lower_proj.append(lower_val)
+
+
+    # -----------------------------------------------------------------------
+    # Initializing Subplots 
+    # -----------------------------------------------------------------------
     fig = make_subplots(
-        rows=5, cols=1,
+        rows=7, cols=1,  # Added a 7th row
         subplot_titles=(
             "Cumulative P&L ($)",
             "Cumulative Return (%)",
             "Daily P&L ($)",
-            "P&L by Series",
-            "P&L by Side",
+            "Win Rate by Series (%)",
+            "Win Rate by Side (%)",
+            "Trade frequency by hour",
+            f"Account Value Projection (Next 30 Days at {alloc_pct*100:.0f}% Alloc)"
         ),
-        vertical_spacing=0.05,
-        row_heights=[0.23, 0.18, 0.18, 0.23, 0.18],
+        vertical_spacing=0.048,
+        row_heights=[0.14, 0.11, 0.11, 0.14, 0.11, 0.14, 0.25], # Added height for projection plot
     )
 
     fig.add_trace(
@@ -349,6 +540,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
             fill="tozeroy",
             fillcolor="rgba(52, 152, 219, 0.15)",
             name="Cumulative P&L",
+            showlegend=False,
         ),
         row=1, col=1,
     )
@@ -365,6 +557,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
             fill="tozeroy",
             fillcolor=pct_fill_color,
             name="Cumulative Return %",
+            showlegend=False,
         ),
         row=2, col=1,
     )
@@ -375,6 +568,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
             x=daily_dates, y=daily_values,
             marker_color=daily_colors,
             name="Daily P&L",
+            showlegend=False,
         ),
         row=3, col=1,
     )
@@ -384,23 +578,142 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
         go.Bar(
             y=series_names, x=series_values,
             orientation="h",
-            marker_color=series_colors,
-            name="Series P&L",
+            marker_color=series_bar_colors,
+            name="Actual Win Rate",
+            showlegend=False,
+            text=[
+                f"{v:.1f}%<br>{w}/{t}"
+                for v, w, t in zip(series_values, series_won_counts, series_trade_counts)
+            ],
+            textposition="inside",
+            insidetextanchor="start",
+            customdata=list(zip(series_won_counts, series_trade_counts)),
+            hovertemplate=(
+                "%{y}<br>Win rate: %{x:.1f}%<br>"
+                "Won / total: %{customdata[0]} / %{customdata[1]}<extra></extra>"
+            ),
         ),
         row=4, col=1,
     )
-    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5, row=4, col=1)
+    
+    fig.add_trace(
+        go.Scatter(
+            x=[None], y=[None],
+            mode="lines",
+            line=dict(color="#f39c12", width=2, dash="dash"),
+            name="Expected Win Rate",
+            showlegend=False,
+        ),
+        row=4, col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=series_expected_values,
+            y=series_names,
+            mode="markers",
+            marker=dict(color="rgba(0,0,0,0)", size=25), 
+            showlegend=False,
+            hovertemplate="Expected: %{x:.1f}%<extra></extra>"
+        ),
+        row=4, col=1,
+    )
+
+    for i, exp_val in enumerate(series_expected_values):
+        fig.add_shape(
+            type="line",
+            x0=exp_val, x1=exp_val,
+            y0=i - 0.4, y1=i + 0.4, 
+            line=dict(color="#f39c12", width=2),
+            row=4, col=1
+        )
 
     fig.add_trace(
         go.Bar(
             x=side_labels, y=side_values,
             marker_color=side_bar_colors,
-            name="Side P&L",
+            name="Side Win Rate",
+            showlegend=False,
+            text=[f"{v:.1f}%" for v in side_values], 
+            textposition="auto",
         ),
         row=5, col=1,
     )
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=5, col=1)
 
+    if sorted_trade_series:
+        for ser in sorted_trade_series:
+            y_h = [hour_series_count.get((h, ser), 0) for h in hours]
+            fig.add_trace(
+                go.Bar(
+                    x=hour_labels,
+                    y=y_h,
+                    name=ser,
+                    marker_color=hourly_series_colors[ser],
+                    showlegend=True,
+                    legendgroup=ser,
+                ),
+                row=6, col=1,
+            )
+    else:
+        fig.add_trace(
+            go.Bar(
+                x=hour_labels,
+                y=[0] * 24,
+                name="No qualifying trades",
+                marker_color="#555",
+                showlegend=False,
+            ),
+            row=6, col=1,
+        )
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=6, col=1)
+
+    # -----------------------------------------------------------------------
+    # PROJECTION PLOT (ROW 7)
+    # -----------------------------------------------------------------------
+    
+    fig.add_trace(
+        go.Scatter(
+            x=x_proj_days, y=lower_proj,
+            mode="lines",
+            line=dict(color="rgba(231,76,60,0.5)", width=1),
+            name="Lower Bound (95% Confidence)",  # <-- UPDATED LABEL
+            showlegend=False,
+            legendgroup="projection"
+        ),
+        row=7, col=1
+    )
+    
+    # 2. Upper Bound (fills the space down to the lower bound)
+    fig.add_trace(
+        go.Scatter(
+            x=x_proj_days, y=upper_proj,
+            mode="lines",
+            line=dict(color="rgba(46,204,113,0.5)", width=1),
+            fill="tonexty", 
+            fillcolor="rgba(255,255,255,0.05)",
+            name="Upper Bound (95% Confidence)",  # <-- UPDATED LABEL
+            showlegend=False,
+            legendgroup="projection"
+        ),
+        row=7, col=1
+    )
+    
+    # 3. Expected Value (Center dash)
+    fig.add_trace(
+        go.Scatter(
+            x=x_proj_days, y=center_proj,
+            mode="lines",
+            line=dict(color="#f39c12", width=3, dash="dash"),
+            name="Expected Value",
+            showlegend=False,
+            legendgroup="projection"
+        ),
+        row=7, col=1
+    )
+
+    # -----------------------------------------------------------------------
+    # Global Stats & Text Formatting
+    # -----------------------------------------------------------------------
     total_pnl = cumulative_pnl[-1] if cumulative_pnl else 0
     trades = [e for e in events if e["type"] == "settlement" and e.get("cost_cents", 0) > 0 and e.get("pnl_cents", 0) != 0]
     total_trades = len(trades)
@@ -421,19 +734,29 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
     fig.update_layout(
         title=dict(
             text=(
-                f"Kalshi Bot Performance | "
+                f"Kalshi Bot Performance | Account Value: ${current_balance:,.2f} | Portfolio Alloc: {alloc_pct*100:.0f}%<br>"
                 f"P&L: <span style='color:{pnl_color}'>${total_pnl:+,.2f}</span> | "
                 f"Return: <span style='color:{pct_color}'>{last_pct:+.2f}%</span> | "
                 f"Avg Cost: ${avg_total_cost:,.2f} | "
                 f"Trades: {total_trades}<br>"
                 f"Expected Win Rate: {expected_win_rate:.1f}% | "
                 f"Actual Win Rate: <span style='color:{wr_color}'>{actual_win_rate:.1f}%</span> "
-                f"({wins}/{total_trades})"
+                f"({wins}/{total_trades})<br>"
+                f"<span style='font-size:14px; color:#b0b0b0'>"
+                f"Sum Trade Return: {total_trade_return_pct:+.2f}% | "
+                f"Avg Trade Return: {avg_trade_return_pct:+.2f}% | "
+                f"Hourly Gain: {hourly_gain:+.4f}% | "
+                f"Daily Gain: {daily_gain:+.2f}% | "
+                f"Weekly Gain: {weekly_gain:+.2f}%"
+                f"</span><br><br>"
             ),
             font=dict(size=18),
+            y=0.98,
         ),
-        height=1800,
-        showlegend=False,
+        height=2680,
+        margin=dict(t=160, b=155),
+        barmode="stack",
+        showlegend=True,
         template="plotly_dark",
         paper_bgcolor="#1a1a2e",
         plot_bgcolor="#16213e",
@@ -443,12 +766,53 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
     fig.update_yaxes(title_text="P&L ($)", row=1, col=1)
     fig.update_yaxes(title_text="Return (%)", row=2, col=1)
     fig.update_yaxes(title_text="P&L ($)", row=3, col=1)
-    fig.update_xaxes(title_text="P&L ($)", row=4, col=1)
+    fig.update_xaxes(title_text="Win Rate (%)", row=4, col=1)
     fig.update_yaxes(autorange="reversed", row=4, col=1)
-    fig.update_yaxes(title_text="P&L ($)", row=5, col=1)
+    fig.update_yaxes(title_text="Win Rate (%)", row=5, col=1)
+    fig.update_yaxes(title_text="Trades", row=6, col=1)
+    fig.update_xaxes(title_text="Local hour (start of 1h block)", row=6, col=1)
+    
+    # Projection formatting
+    fig.update_yaxes(title_text="Projected Value ($)", row=7, col=1)
+    fig.update_xaxes(title_text="Days from now", row=7, col=1)
+
+    # Legend in the gap between row 6 (trade frequency) and row 7 (projection), not under row 7
+    y6 = fig.layout.yaxis6.domain
+    y7 = fig.layout.yaxis7.domain
+    gap_lo, gap_hi = y7[1], y6[0]
+    # Below mid-gap (toward projection); clamp so it stays above row 7’s plot area
+    legend_y = max(gap_lo + 0.012, (gap_lo + gap_hi) / 2 - 0.018)
+    fig.update_layout(
+        legend=dict(
+            orientation="h",
+            yanchor="middle",
+            y=legend_y,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11),
+        ),
+    )
 
     fig.write_html(output_file, include_plotlyjs="cdn")
-    print(f"Dashboard saved to {output_file}")
+    print(f"Dashboard saved to {output_file}\n")
+    
+    message = (
+                f"=== Kalshi Bot Performance ===\n"
+                f"Current Account Value: ${current_balance:,.2f}\n"
+                f"P&L: ${total_pnl:+,.2f}| "
+                f"Return: {last_pct:+.2f}% | "
+                f"Avg Cost: ${avg_total_cost:,.2f} | "
+                f"Trades: {total_trades}\n"
+                f"Expected Win Rate: {expected_win_rate:.1f}% | "
+                f"Actual Win Rate: {actual_win_rate:.1f}%"
+                f" ({wins}/{total_trades})\n"
+                f"Sum Trade Return: {total_trade_return_pct:+.2f}% | "
+                f"Avg Trade Return: {avg_trade_return_pct:+.2f}% | "
+                f"Hourly Gain: {hourly_gain:+.4f}% | "
+                f"Daily Gain: {daily_gain:+.2f}% | "
+                f"Weekly Gain: {weekly_gain:+.2f}%"
+            )
+    print(message)
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +822,10 @@ def build_dashboard(events: list[dict], offset_dollars: float, output_file: str)
 def main() -> None:
     private_key = config.load_private_key()
     client = KalshiClient(config.BASE_URL, config.API_KEY_ID, private_key)
+
+    # Fetch current balance specifically for the projection model
+    current_balance = fetch_portfolio_balance(client)
+    print(f"Current Kalshi Balance: ${current_balance:,.2f}")
 
     min_ts = _parse_ts(START_DATE)
 
@@ -472,7 +840,8 @@ def main() -> None:
     events = build_pnl_events(fills, settlements)
     print(f"  {len(events)} total P&L events")
 
-    build_dashboard(events, OFFSET_DOLLARS, OUTPUT_FILE)
+    write_events_csv(events, EVENTS_CSV_FILE)
+    build_dashboard(events, OFFSET_DOLLARS, current_balance, PORTFOLIO_ALLOCATION, OUTPUT_FILE)
 
 
 if __name__ == "__main__":

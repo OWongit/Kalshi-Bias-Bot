@@ -44,24 +44,25 @@ C = {
 # ---------------------------------------------------------------------------
 # Configuration — edit these values directly
 # ---------------------------------------------------------------------------
-DATA_DIR = "calibration/past_data/KXBTC15M"
-ENTRY_MIN = 95         # Lowest entry_price to test
-ENTRY_MAX = 99          # Highest entry_price to test 
+DATA_DIR = "calibration/past_data/KXETH15M"
+ENTRY_MIN = 92         # Lowest entry_price to test
+ENTRY_MAX = 92          # Highest entry_price to test 
 STOP_MIN = 0            # Lowest stop_loss to test
 STOP_MAX = 0            # Highest stop_loss to test
 # MAX_SPREAD_LIST = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-MAX_SPREAD_LIST = [1]  # Max bid-ask spread values to test (cents)
+MAX_SPREAD_LIST = [5]  # Max bid-ask spread values to test (cents)
 # MIN_OPEN_INTEREST_LIST = [None, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,]  # Open interest thresholds to test (None = no filter)
-MIN_OPEN_INTEREST_LIST = [1000]  # Open interest thresholds to test (None = no filter)
+MIN_OPEN_INTEREST_LIST = [8000]  # Open interest thresholds to test (None = no filter)
 COOLDOWN_SECONDS_LIST = [0]  # Cooldown values to test (seconds after stop-loss)
-SIDE_LIST = ["both"]  # Contract sides to test: "yes", "no", "both"
+# Three separate strings — NOT one string like "yes, no, both" (that would be a single invalid side).
+SIDE_LIST = ["no", "yes", "both"]  # Each value is swept as its own row
 TOP_N = 20              # Number of top results to display
 TOP_N_TO_TEST = 5      # Number of top configs to test on test set (when SETTING="both")
 RESULTS_DIR = "calibration/sweep_results"
 
 SETTING = "both"       # "training" | "testing" | "both"
 TRAIN_RATIO = 0.7      # Fraction of markets for training
-SPLIT_SEED = 24    # For reproducible random split
+SPLIT_SEED = 78   # For reproducible random split
 BEST_PARAMS_FILE = "calibration/sweep_results/best_params.json"
 
 
@@ -358,6 +359,14 @@ def main():
 
     if setting not in ("training", "testing", "both"):
         raise SystemExit(f"Invalid SETTING: {setting!r}. Use 'training', 'testing', or 'both'.")
+
+    _valid_sides = frozenset({"yes", "no", "both"})
+    for _sd in side_list:
+        if _sd not in _valid_sides:
+            raise SystemExit(
+                f"Invalid SIDE_LIST entry {_sd!r}. Each item must be exactly 'yes', 'no', or 'both'. "
+                f"Use three list elements, e.g. [\"yes\", \"no\", \"both\"] — not one string \"yes, no, both\"."
+            )
 
     train_tickers, test_tickers = _split_tickers(data_dir, train_ratio, split_seed)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
