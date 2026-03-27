@@ -5,6 +5,10 @@ combination, and report the best-performing configurations.
 Usage:
     Edit the configuration section below, then run:
     python calibration/optimize.py
+
+    Set LOOKBACK_DAYS to e.g. 5, 7, or 50 to restrict to markets whose ticker
+    encodes an event date in that window (parsed from ``-YYMONDD...`` in the
+    filename). Use None for all CSVs.
 """
 
 import atexit
@@ -14,7 +18,7 @@ import os
 import random
 import signal
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 try:
     import colorama
@@ -22,7 +26,7 @@ try:
 except ImportError:
     colorama = None
 
-from backtest import load_markets_manifest, run_backtest
+from backtest import load_markets_manifest, parse_event_date_from_ticker, run_backtest
 
 # ANSI color codes (no-op if colorama not installed on Windows)
 def _c(code: str) -> str:
@@ -44,35 +48,60 @@ C = {
 # ---------------------------------------------------------------------------
 # Configuration — edit these values directly
 # ---------------------------------------------------------------------------
-DATA_DIR = "calibration/past_data/KXETH15M"
-ENTRY_MIN = 92         # Lowest entry_price to test
-ENTRY_MAX = 92          # Highest entry_price to test 
+DATA_DIR = "calibration/past_data/KXSOL15M"
+# Only include markets whose ticker encodes an event date in the last N calendar
+# days (inclusive of today). None = all markets with a CSV.
+LOOKBACK_DAYS = 500    # e.g. 5, 7, or 50
+ENTRY_MIN = 98        # Lowest entry_price to test
+ENTRY_MAX = 98          # Highest entry_price to test 
 STOP_MIN = 0            # Lowest stop_loss to test
 STOP_MAX = 0            # Highest stop_loss to test
-# MAX_SPREAD_LIST = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-MAX_SPREAD_LIST = [5]  # Max bid-ask spread values to test (cents)
-# MIN_OPEN_INTEREST_LIST = [None, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,]  # Open interest thresholds to test (None = no filter)
-MIN_OPEN_INTEREST_LIST = [8000]  # Open interest thresholds to test (None = no filter)
+# MAX_SPREAD_LIST = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 50, 75, 76, 77, 78, 79, 80, 81, 82, 83,99]
+MAX_SPREAD_LIST = [2]  # Max bid-ask spread values to test (cents)
+MIN_OPEN_INTEREST_LIST = [8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000]  # Open interest thresholds to test (None = no filter)
+#MIN_OPEN_INTEREST_LIST = [None]  # Open interest thresholds to test (None = no filter)
 COOLDOWN_SECONDS_LIST = [0]  # Cooldown values to test (seconds after stop-loss)
 # Three separate strings — NOT one string like "yes, no, both" (that would be a single invalid side).
-SIDE_LIST = ["no", "yes", "both"]  # Each value is swept as its own row
+SIDE_LIST = ["yes", "no", "both"]  # Each value is swept as its own row
 TOP_N = 20              # Number of top results to display
 TOP_N_TO_TEST = 5      # Number of top configs to test on test set (when SETTING="both")
 RESULTS_DIR = "calibration/sweep_results"
 
 SETTING = "both"       # "training" | "testing" | "both"
 TRAIN_RATIO = 0.7      # Fraction of markets for training
-SPLIT_SEED = 78   # For reproducible random split
+SPLIT_SEED = 45   # For reproducible random split
 BEST_PARAMS_FILE = "calibration/sweep_results/best_params.json"
 
 
-def _split_tickers(data_dir: str, train_ratio: float, seed: int) -> tuple[set[str], set[str]]:
-    """Split tickers into train/test sets. Only includes tickers with CSV files."""
+def _split_tickers(
+    data_dir: str,
+    train_ratio: float,
+    seed: int,
+    lookback_days: int | None = None,
+    as_of: date | None = None,
+) -> tuple[set[str], set[str]]:
+    """Split tickers into train/test sets. Only includes tickers with CSV files.
+
+    If *lookback_days* is a positive int, only tickers whose event date (parsed
+    from the filename, ``-YYMONDD...``) falls in the last *lookback_days* calendar
+    days (inclusive of *as_of*, default today) are eligible.
+    """
     manifest = load_markets_manifest(data_dir)
-    tickers = [
-        t for t in manifest
-        if os.path.exists(os.path.join(data_dir, f"{t}.csv"))
-    ]
+    ref = as_of or date.today()
+    if lookback_days is not None and lookback_days > 0:
+        cutoff = ref - timedelta(days=max(0, lookback_days - 1))
+    else:
+        cutoff = None
+
+    tickers: list[str] = []
+    for t in manifest:
+        if not os.path.exists(os.path.join(data_dir, f"{t}.csv")):
+            continue
+        if cutoff is not None:
+            ev = parse_event_date_from_ticker(t)
+            if ev is None or ev < cutoff:
+                continue
+        tickers.append(t)
     rng = random.Random(seed)
     rng.shuffle(tickers)
     n_train = max(1, int(len(tickers) * train_ratio))
@@ -127,6 +156,8 @@ def _format_results_txt(results: list[dict], settings: dict, top: int,
 
     lines.append("Settings:")
     lines.append(f"  Data dir:           {settings['data_dir']}")
+    if settings.get("lookback_days") is not None:
+        lines.append(f"  Lookback (days):    {settings['lookback_days']}")
     if "train_markets" in settings:
         lines.append(f"  Train markets:      {settings['train_markets']}")
     if "test_markets" in settings:
@@ -202,7 +233,9 @@ def _run_training(data_dir: str, train_tickers: set[str], settings: dict,
 
     print(f"{C['cyan']}{C['bold']}Sweeping {total} (entry_price, stop_loss, cooldown, max_spread, min_oi, side) combinations on TRAIN split{C['reset']} …")
     print(f"  Data dir:   {data_dir}")
-    print(f"  Train markets: {len(train_tickers)}")
+    if settings.get("lookback_days") is not None:
+        print(f"  Lookback:   last {settings['lookback_days']} calendar day(s)")
+    print(f"  Test markets (held out): {settings['test_markets']}")
     print(f"  Max spread list: {settings['max_spread_list']}¢  min_oi_list: {settings['min_oi_list']}  "
           f"cooldown: {settings['cooldown_list']}  side: {settings.get('side_list', ['no'])}\n")
 
@@ -356,6 +389,7 @@ def main():
     train_ratio = TRAIN_RATIO
     split_seed = SPLIT_SEED
     best_params_file = BEST_PARAMS_FILE
+    lookback_days = LOOKBACK_DAYS
 
     if setting not in ("training", "testing", "both"):
         raise SystemExit(f"Invalid SETTING: {setting!r}. Use 'training', 'testing', or 'both'.")
@@ -368,7 +402,19 @@ def main():
                 f"Use three list elements, e.g. [\"yes\", \"no\", \"both\"] — not one string \"yes, no, both\"."
             )
 
-    train_tickers, test_tickers = _split_tickers(data_dir, train_ratio, split_seed)
+    train_tickers, test_tickers = _split_tickers(
+        data_dir, train_ratio, split_seed, lookback_days=lookback_days,
+    )
+    if not train_tickers and not test_tickers:
+        raise SystemExit(
+            "No markets after applying LOOKBACK_DAYS and CSV filter. "
+            "Try LOOKBACK_DAYS = None or a larger window."
+        )
+    print(
+        f"{C['cyan']}Markets used —{C['reset']} "
+        f"training: {C['bold']}{len(train_tickers)}{C['reset']}, "
+        f"testing: {C['bold']}{len(test_tickers)}{C['reset']}\n"
+    )
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     slug = os.path.basename(data_dir)
 
@@ -385,6 +431,7 @@ def main():
         "timestamp": timestamp,
         "train_markets": len(train_tickers),
         "test_markets": len(test_tickers),
+        "lookback_days": lookback_days,
     }
 
     combos = [

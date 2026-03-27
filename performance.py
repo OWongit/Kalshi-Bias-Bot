@@ -29,7 +29,7 @@ from api_client import KalshiClient
 # ---------------------------------------------------------------------------
 START_DATE = "2026-3-19"      # Only include activity from this date onward (YYYY-MM-DD)
 OFFSET_DOLLARS = 0            # Shift the P&L baseline (e.g. initial deposit adjustment)
-PORTFOLIO_ALLOCATION = 0.10   # The % of your account allocated per trade (0.10 = 10%)
+PORTFOLIO_ALLOCATION = 0.02   # The % of your account allocated per trade (0.10 = 10%)
 OUTPUT_FILE = "performance.html"
 EVENTS_CSV_FILE = "performance_events.csv"
 # Local timezone for chart times, daily P&L buckets, and hourly frequency (IANA).
@@ -199,7 +199,10 @@ def _parse_settlement_ts(s: dict) -> datetime:
 
 
 def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
-    """Build realized P&L events: one entry per settled market or sell fill."""
+    """Build realized P&L events: one entry per settled market or sell fill.
+
+    Drops events with ``cost_cents == 0``.
+    """
     ticker_cost: dict[str, float] = defaultdict(float)  # total spent (cents)
     ticker_buy_count: dict[str, int] = defaultdict(int)  # total contracts bought
     ticker_sell_revenue: dict[str, float] = defaultdict(float)
@@ -277,29 +280,49 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
         })
 
     events.sort(key=lambda e: e["ts"])
+    events = [e for e in events if (e.get("cost_cents") or 0) != 0]
     return events
 
 
+def _csv_derived_contract_cost(cost_cents: float, buy_count: int) -> float | str:
+    """cost_cents / buy_count (¢ per contract); empty if buy_count is 0."""
+    if buy_count <= 0:
+        return ""
+    return round(cost_cents / buy_count, 6)
+
+
+def _csv_derived_percent_gain(cost_cents: float, pnl_cents: float) -> float | str:
+    """(((cost + pnl) / cost) - 1) * 100; empty if cost is 0."""
+    if cost_cents == 0:
+        return ""
+    return round(((cost_cents + pnl_cents) / cost_cents - 1.0) * 100.0, 6)
+
+
 def write_events_csv(events: list[dict], path: str) -> None:
+    """Omits rows with buy_count == 0. Adds contract_cost and percent_gain.
+
+    Excludes columns: ts_utc, ticker, type (ts_local is kept).
+    """
     display_tz, _ = _resolve_display_timezone()
     rows = [e for e in events if int(e.get("buy_count") or 0) != 0]
+    derived = ("contract_cost", "percent_gain")
+    _csv_skip_keys = frozenset({"ts", "ticker", "type", *derived})
     if rows:
         keys: set[str] = set()
         for e in rows:
             keys |= e.keys()
-        keys.discard("ts")
-        fieldnames = ["ts_utc", "ts_local"] + sorted(keys)
+        keys -= _csv_skip_keys
+        fieldnames = ["ts_local"] + sorted(keys) + list(derived)
     else:
         fieldnames = [
-            "ts_utc",
             "ts_local",
-            "ticker",
             "series",
-            "type",
             "pnl_cents",
             "cost_cents",
             "buy_count",
             "fill_side",
+            "contract_cost",
+            "percent_gain",
         ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -309,11 +332,18 @@ def write_events_csv(events: list[dict], path: str) -> None:
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             row: dict[str, object] = {
-                "ts_utc": ts.astimezone(timezone.utc).isoformat(),
                 "ts_local": _ts_for_display(ts, display_tz).isoformat(),
             }
-            for k in fieldnames[2:]:
-                row[k] = e.get(k, "")
+            cost = float(e.get("cost_cents") or 0)
+            pnl = float(e.get("pnl_cents") or 0)
+            bc = int(e.get("buy_count") or 0)
+            for k in fieldnames[1:]:
+                if k == "contract_cost":
+                    row[k] = _csv_derived_contract_cost(cost, bc)
+                elif k == "percent_gain":
+                    row[k] = _csv_derived_percent_gain(cost, pnl)
+                else:
+                    row[k] = e.get(k, "")
             w.writerow(row)
     print(f"Events CSV saved to {path} ({len(rows)} rows, buy_count != 0)")
 
@@ -361,38 +391,81 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
         pct = (running_pnl_for_pct / avg_cost * 100) if avg_cost > 0 else 0.0
         pct_values.append(pct)
 
-    series_trades: dict[str, int] = defaultdict(int)
-    series_wins: dict[str, int] = defaultdict(int)
+    def _position_side(e: dict) -> str:
+        s = str(e.get("fill_side", "no")).lower()
+        return s if s in ("yes", "no") else "no"
+
+    series_side_trades: dict[tuple[str, str], int] = defaultdict(int)
+    series_side_wins: dict[tuple[str, str], int] = defaultdict(int)
     for e in events:
         if e["type"] != "settlement" or e.get("cost_cents", 0) <= 0 or e.get("pnl_cents", 0) == 0:
             continue
-        series_trades[e["series"]] += 1
+        key = (e["series"], _position_side(e))
+        series_side_trades[key] += 1
         if e["pnl_cents"] > 0:
-            series_wins[e["series"]] += 1
+            series_side_wins[key] += 1
 
-    series_win_rates = {}
-    for s, t in series_trades.items():
-        series_win_rates[s] = (series_wins[s] / t * 100) if t > 0 else 0
-
-    sorted_series = sorted(series_win_rates.items(), key=lambda x: x[1], reverse=True)
-    series_names = [s[0] for s in sorted_series]
-    series_values = [s[1] for s in sorted_series]
-    series_trade_counts = [series_trades[s] for s in series_names]
-    series_won_counts = [series_wins[s] for s in series_names]
-    series_bar_colors = ["#2ecc71" if v >= 50 else "#e74c3c" for v in series_values]
-
-    series_market_expected_wrs: dict[str, list[float]] = defaultdict(list)
+    series_side_expected_lists: dict[tuple[str, str], list[float]] = defaultdict(list)
     for e in events:
         if e["type"] == "settlement" and e.get("cost_cents", 0) > 0 and e.get("pnl_cents", 0) != 0:
             if e.get("buy_count", 0) > 0:
                 expected_wr = e["cost_cents"] / e["buy_count"]
-                series_market_expected_wrs[e["series"]].append(expected_wr)
+                series_side_expected_lists[(e["series"], _position_side(e))].append(expected_wr)
 
-    series_expected_values = []
-    for s in series_names:
-        wrs = series_market_expected_wrs.get(s, [])
-        avg_exp = sum(wrs) / len(wrs) if wrs else 0
-        series_expected_values.append(avg_exp)
+    series_with_trades = {k[0] for k in series_side_trades}
+    series_best_wr: dict[str, float] = {}
+    for ser in series_with_trades:
+        wrs = []
+        for side in ("yes", "no"):
+            t = series_side_trades.get((ser, side), 0)
+            if t <= 0:
+                continue
+            w = series_side_wins.get((ser, side), 0)
+            wrs.append(100.0 * w / t)
+        series_best_wr[ser] = max(wrs) if wrs else 0.0
+
+    sorted_series_for_plot = sorted(
+        series_with_trades,
+        key=lambda s: series_best_wr.get(s, 0.0),
+        reverse=True,
+    )
+
+    series_pnl_totals: dict[str, float] = defaultdict(float)
+    series_cost_totals: dict[str, float] = defaultdict(float)
+    for e in events:
+        ser = e["series"]
+        series_pnl_totals[ser] += float(e.get("pnl_cents") or 0)
+        series_cost_totals[ser] += float(e.get("cost_cents") or 0)
+
+    series_pnl_by_row = [series_pnl_totals[s] / 100.0 for s in sorted_series_for_plot]
+    series_pct_gain_by_row = [
+        (100.0 * series_pnl_totals[s] / series_cost_totals[s]) if series_cost_totals[s] > 0 else 0.0
+        for s in sorted_series_for_plot
+    ]
+    series_pnl_bar_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in series_pnl_by_row]
+    series_pct_bar_colors = ["#3498db" if v >= 0 else "#e67e22" for v in series_pct_gain_by_row]
+
+    series_names: list[str] = []
+    series_values: list[float] = []
+    series_trade_counts: list[int] = []
+    series_won_counts: list[int] = []
+    series_expected_values: list[float] = []
+    for ser in sorted_series_for_plot:
+        for side in ("yes", "no"):
+            key = (ser, side)
+            t = series_side_trades.get(key, 0)
+            w = series_side_wins.get(key, 0)
+            wr = (100.0 * w / t) if t > 0 else 0.0
+            wrs_exp = series_side_expected_lists.get(key, [])
+            avg_exp = sum(wrs_exp) / len(wrs_exp) if wrs_exp else 0.0
+            label = f"{ser} · {side.upper()}"
+            series_names.append(label)
+            series_values.append(wr)
+            series_trade_counts.append(t)
+            series_won_counts.append(w)
+            series_expected_values.append(avg_exp)
+
+    series_bar_colors = ["#2ecc71" if v >= 50 else "#e74c3c" for v in series_values]
 
     side_trades: dict[str, int] = defaultdict(int)
     side_wins: dict[str, int] = defaultdict(int)
@@ -518,18 +591,30 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
     # Initializing Subplots 
     # -----------------------------------------------------------------------
     fig = make_subplots(
-        rows=7, cols=1,  # Added a 7th row
+        rows=8,
+        cols=1,
         subplot_titles=(
             "Cumulative P&L ($)",
             "Cumulative Return (%)",
             "Daily P&L ($)",
-            "Win Rate by Series (%)",
+            "Win Rate by Series & side (YES / NO) (%)",
+            "P&L ($) & return (%) by series",
             "Win Rate by Side (%)",
             "Trade frequency by hour",
-            f"Account Value Projection (Next 30 Days at {alloc_pct*100:.0f}% Alloc)"
+            f"Account Value Projection (Next 30 Days at {alloc_pct*100:.0f}% Alloc)",
         ),
-        vertical_spacing=0.048,
-        row_heights=[0.14, 0.11, 0.11, 0.14, 0.11, 0.14, 0.25], # Added height for projection plot
+        vertical_spacing=0.042,
+        row_heights=[0.12, 0.10, 0.10, 0.12, 0.11, 0.10, 0.12, 0.23],
+        specs=[
+            [{}],
+            [{}],
+            [{}],
+            [{}],
+            [{"secondary_y": True}],
+            [{}],
+            [{}],
+            [{}],
+        ],
     )
 
     fig.add_trace(
@@ -582,7 +667,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             name="Actual Win Rate",
             showlegend=False,
             text=[
-                f"{v:.1f}%<br>{w}/{t}"
+                (f"{v:.1f}%<br>{w}/{t}" if t > 0 else "—<br>0 trades")
                 for v, w, t in zip(series_values, series_won_counts, series_trade_counts)
             ],
             textposition="inside",
@@ -628,6 +713,47 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             row=4, col=1
         )
 
+    if sorted_series_for_plot:
+        fig.add_trace(
+            go.Bar(
+                x=sorted_series_for_plot,
+                y=series_pnl_by_row,
+                marker_color=series_pnl_bar_colors,
+                showlegend=False,
+                text=[f"${v:+,.2f}" for v in series_pnl_by_row],
+                textposition="outside",
+                cliponaxis=False,
+                hovertemplate="%{x}<br>P&L: $%{y:+,.2f}<extra></extra>",
+            ),
+            row=5,
+            col=1,
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sorted_series_for_plot,
+                y=series_pct_gain_by_row,
+                mode="markers+text",
+                marker=dict(size=14, color=series_pct_bar_colors, line=dict(width=1, color="#ecf0f1")),
+                showlegend=False,
+                text=[f"{v:+.1f}%" for v in series_pct_gain_by_row],
+                textposition="top center",
+                textfont=dict(size=11, color="#ecf0f1"),
+                cliponaxis=False,
+                hovertemplate="%{x}<br>Return: %{y:+.2f}%<extra></extra>",
+            ),
+            row=5,
+            col=1,
+            secondary_y=True,
+        )
+    else:
+        fig.add_trace(
+            go.Bar(x=["—"], y=[0], showlegend=False, marker_color="#555"),
+            row=5,
+            col=1,
+            secondary_y=False,
+        )
+
     fig.add_trace(
         go.Bar(
             x=side_labels, y=side_values,
@@ -637,7 +763,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             text=[f"{v:.1f}%" for v in side_values], 
             textposition="auto",
         ),
-        row=5, col=1,
+        row=6, col=1,
     )
 
     if sorted_trade_series:
@@ -652,7 +778,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
                     showlegend=True,
                     legendgroup=ser,
                 ),
-                row=6, col=1,
+                row=7, col=1,
             )
     else:
         fig.add_trace(
@@ -663,12 +789,12 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
                 marker_color="#555",
                 showlegend=False,
             ),
-            row=6, col=1,
+            row=7, col=1,
         )
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=6, col=1)
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=7, col=1)
 
     # -----------------------------------------------------------------------
-    # PROJECTION PLOT (ROW 7)
+    # PROJECTION PLOT (ROW 8)
     # -----------------------------------------------------------------------
     
     fig.add_trace(
@@ -680,7 +806,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             showlegend=False,
             legendgroup="projection"
         ),
-        row=7, col=1
+        row=8, col=1
     )
     
     # 2. Upper Bound (fills the space down to the lower bound)
@@ -695,7 +821,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             showlegend=False,
             legendgroup="projection"
         ),
-        row=7, col=1
+        row=8, col=1
     )
     
     # 3. Expected Value (Center dash)
@@ -708,7 +834,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             showlegend=False,
             legendgroup="projection"
         ),
-        row=7, col=1
+        row=8, col=1
     )
 
     # -----------------------------------------------------------------------
@@ -753,7 +879,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             font=dict(size=18),
             y=0.98,
         ),
-        height=2680,
+        height=2880,
         margin=dict(t=160, b=155),
         barmode="stack",
         showlegend=True,
@@ -768,17 +894,20 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
     fig.update_yaxes(title_text="P&L ($)", row=3, col=1)
     fig.update_xaxes(title_text="Win Rate (%)", row=4, col=1)
     fig.update_yaxes(autorange="reversed", row=4, col=1)
-    fig.update_yaxes(title_text="Win Rate (%)", row=5, col=1)
-    fig.update_yaxes(title_text="Trades", row=6, col=1)
-    fig.update_xaxes(title_text="Local hour (start of 1h block)", row=6, col=1)
+    fig.update_xaxes(title_text="Series", tickangle=-40, row=5, col=1)
+    fig.update_yaxes(title_text="P&L ($)", row=5, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Return (%)", row=5, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="Win Rate (%)", row=6, col=1)
+    fig.update_yaxes(title_text="Trades", row=7, col=1)
+    fig.update_xaxes(title_text="Local hour (start of 1h block)", row=7, col=1)
     
     # Projection formatting
-    fig.update_yaxes(title_text="Projected Value ($)", row=7, col=1)
-    fig.update_xaxes(title_text="Days from now", row=7, col=1)
+    fig.update_yaxes(title_text="Projected Value ($)", row=8, col=1)
+    fig.update_xaxes(title_text="Days from now", row=8, col=1)
 
-    # Legend in the gap between row 6 (trade frequency) and row 7 (projection), not under row 7
-    y6 = fig.layout.yaxis6.domain
-    y7 = fig.layout.yaxis7.domain
+    # Legend in the gap between trade frequency (row 7) and projection (row 8)
+    y6 = fig.layout.yaxis7.domain
+    y7 = fig.layout.yaxis8.domain
     gap_lo, gap_hi = y7[1], y6[0]
     # Below mid-gap (toward projection); clamp so it stays above row 7’s plot area
     legend_y = max(gap_lo + 0.012, (gap_lo + gap_hi) / 2 - 0.018)

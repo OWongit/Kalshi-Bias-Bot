@@ -3,8 +3,11 @@ Standalone backtest of the entry / stop-loss strategy on historical
 candlestick CSVs.  Supports buying YES, NO, or both sides.
 
 Usage:
-    python calibration/backtest.py calibration/past_data/KXNCAAMBGAME \
-        --entry_price 95 --stop_loss 70 --max_spread 2
+    python calibration/backtest.py
+
+    Edit DATA_DIR, ENTRY_PRICE, etc. Set LOOKBACK_DAYS to limit to recent
+    markets by the date embedded in each CSV filename (``-YYMONDD...`` after
+    the series prefix). None = all markets in the folder.
 
 No imports from the parent project — reads only CSV files.
 """
@@ -12,8 +15,10 @@ No imports from the parent project — reads only CSV files.
 import csv
 import math
 import os
+import re
 import statistics
 import sys
+from datetime import date, timedelta
 
 
 def _safe_int(val):
@@ -23,6 +28,38 @@ def _safe_int(val):
     try:
         return int(round(float(val)))
     except (ValueError, TypeError):
+        return None
+
+
+_MONTH_ABBREV = {
+    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+}
+
+# Kalshi tickers embed a calendar date after the series prefix, e.g.
+#   KXBTC15M-26MAR241045-45  -> 2026-03-24
+#   KXNCAAMBGAME-25DEC01BGSUKSU-BGSU -> 2025-12-01
+_TICKER_DATE_RE = re.compile(
+    r"-(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})",
+    re.IGNORECASE,
+)
+
+
+def parse_event_date_from_ticker(ticker: str) -> date | None:
+    """Return the event calendar date encoded in *ticker*, or None if not found."""
+    m = _TICKER_DATE_RE.search(ticker)
+    if not m:
+        return None
+    yy = int(m.group(1))
+    mon = m.group(2).upper()
+    dd = int(m.group(3))
+    month = _MONTH_ABBREV.get(mon)
+    if month is None:
+        return None
+    year = 2000 + yy if yy < 100 else yy
+    try:
+        return date(year, month, dd)
+    except ValueError:
         return None
 
 
@@ -255,18 +292,33 @@ def run_backtest(
     verbose: bool = False,
     ticker_filter: set[str] | None = None,
     side: str = "no",
+    lookback_days: int | None = None,
+    as_of: date | None = None,
 ) -> dict:
     """Run the backtest over all markets in *data_dir*.
+
+    If *lookback_days* is a positive int, only markets whose event date (parsed
+    from the ticker filename) falls in the last *lookback_days* calendar days
+    (inclusive of *as_of*, default today) are included.
 
     Returns a summary dict with aggregate stats.
     """
     manifest = load_markets_manifest(data_dir)
+    ref = as_of or date.today()
+    if lookback_days is not None and lookback_days > 0:
+        lookback_cutoff = ref - timedelta(days=max(0, lookback_days - 1))
+    else:
+        lookback_cutoff = None
 
     market_stats: list[dict] = []
 
     for ticker, meta in manifest.items():
         if ticker_filter is not None and ticker not in ticker_filter:
             continue
+        if lookback_cutoff is not None:
+            ev = parse_event_date_from_ticker(ticker)
+            if ev is None or ev < lookback_cutoff:
+                continue
         csv_path = os.path.join(data_dir, f"{ticker}.csv")
         if not os.path.exists(csv_path):
             continue
@@ -410,6 +462,9 @@ MAX_SPREAD = 1          # Max bid-ask spread for entry (cents)
 MIN_OPEN_INTEREST = None  # Skip candles with open_interest below this (None = no filter)
 COOLDOWN_SECONDS = 300  # Seconds to wait after a stop-loss before re-entering
 SIDE = "no"             # "yes", "no", or "both"
+# Only include markets whose ticker encodes an event date in the last N calendar
+# days (inclusive of today). None = use all CSVs in the directory.
+LOOKBACK_DAYS = None    # e.g. 5, 7, or 50
 
 # Set SINGLE_CSV to a file path to backtest just one market instead of the
 # whole directory.  Set to None to run the full directory backtest.
@@ -426,6 +481,7 @@ def main():
     min_oi = MIN_OPEN_INTEREST
     cooldown = COOLDOWN_SECONDS
     side = SIDE
+    lookback_days = LOOKBACK_DAYS
 
     if SINGLE_CSV:
         # Single-file mode
@@ -440,11 +496,16 @@ def main():
     print(f"\nBacktest: side={side}  entry={entry_price}¢  stop_loss={stop_loss}¢  "
           f"max_spread={max_spread}¢  min_open_interest={min_oi}  "
           f"cooldown={cooldown}s")
-    print(f"Data dir: {data_dir}\n")
+    print(f"Data dir: {data_dir}")
+    if lookback_days is not None and lookback_days > 0:
+        ref = date.today()
+        lo = ref - timedelta(days=max(0, lookback_days - 1))
+        print(f"Lookback: last {lookback_days} calendar day(s), event dates in [{lo}, {ref}]")
+    print()
 
     summary = run_backtest(
         data_dir, entry_price, stop_loss, max_spread, min_oi, cooldown,
-        verbose=True, side=side,
+        verbose=True, side=side, lookback_days=lookback_days,
     )
 
     print(f"\n{'='*70}")
