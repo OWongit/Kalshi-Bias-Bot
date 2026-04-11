@@ -30,14 +30,14 @@ import plotly.graph_objects as go
 from backtest import run_backtest
 
 # Defaults (override via CLI)
-DATA_DIR = "calibration/past_data/KXSOL15M"  # directory with _markets.csv + per-ticker CSVs
-ENTRY_MIN = 90
+DATA_DIR = "calibration/past_data/KXNBAGAME"  # directory with _markets.csv + per-ticker CSVs
+ENTRY_MIN = 0
 ENTRY_MAX = 99
 STOP_LOSS = 0
 MAX_SPREAD = 1
-MIN_OPEN_INTEREST = None
+MIN_OPEN_INTEREST = 5000
 COOLDOWN_SECONDS = 0
-SIDE = "no"
+SIDE = "both"
 LOOKBACK_DAYS = None
 # Centered moving-average window for CI upper/lower along entry (odd ≥3, or 1 = raw Wilson)
 CI_MA_WINDOW = 1

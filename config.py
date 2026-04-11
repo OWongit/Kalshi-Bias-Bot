@@ -28,15 +28,15 @@ BASE_URL = "https://api.elections.kalshi.com"
 # ---------------------------------------------------------------------------
 # Trading Parameters (global fallbacks; per-category overrides in categories.json)
 # ---------------------------------------------------------------------------
-MAX_OPEN_POSITIONS = 100          # Max concurrent markets with an open NO position
-MAX_PCT_PER_MARKET = 0.02       # Fraction of balance allocated per new market (3%)
+MAX_OPEN_POSITIONS = 100        # Max concurrent markets with an open NO position
+MAX_PCT_PER_MARKET = 0.02       # Fraction of balance allocated per new market
 MIN_CONTRACTS = 1               # Minimum contracts per order
 MAX_CONTRACTS = 10_000          # Maximum contracts per order
 
 STOP_LOSS_POLL_SECONDS =   0.10     # Sleep between main-loop iterations
 DRY_RUN = False                  # True = log orders without sending them
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------  -----------
 # Discovery
 # ---------------------------------------------------------------------------
 CATEGORIES_FILE = "categories.json"  # JSON with categories and per-category params

@@ -5,18 +5,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ---------------------------------------------------------------------------
-# Configurable: change this to use a different service/device name.
-# Use lowercase with hyphens for SERVICE_NAME (e.g. daq, launch-controller) - no spaces.
-# Optionally set DISPLAY_NAME for banner text (e.g. "Launch Controller").
-# Updates the systemd service name, service file, and all systemctl commands.
+# Optional: DISPLAY_NAME for the installer banner only.
 #
-# This script also:
+# This script:
 #   - Creates a Python virtual environment (.venv)
 #   - Installs all libraries from requirements.txt
-#   - Configures desktop autostart: a terminal window opens on login and runs main.py
-#   - Requires: Raspberry Pi OS with Desktop, and Desktop Autologin enabled
+#   - Prepares launcher.sh (optional helper; no GUI autostart)
+#
+# For headless operation, run main.py via systemd, cron, or your process
+# supervisor — this installer does not open a terminal on login.
 # ---------------------------------------------------------------------------
-SERVICE_NAME="${SERVICE_NAME:-trader}"
 DISPLAY_NAME="${DISPLAY_NAME:-Kalshi Trading Bot}"
 
 # ANSI colors: neon green for logo, gold for highlights
@@ -47,7 +45,7 @@ echo -e "${GOLD}${SEP}${RESET}"
 
 # System packages required for Python venv support
 echo ""
-echo -e "${GOLD}[1/4] Installing system dependencies...${RESET}"
+echo -e "${GOLD}[1/3] Installing system dependencies...${RESET}"
 sudo apt-get update
 sudo apt-get install -y \
     python3 \
@@ -55,24 +53,22 @@ sudo apt-get install -y \
     python3-pip \
     python3-dev \
     libgpiod-dev \
-    lxterminal \
-    wmctrl \
     git
 
 # Create virtual environment
 VENV_DIR="$SCRIPT_DIR/.venv"
 if [ -d "$VENV_DIR" ]; then
     echo ""
-    echo -e "${GOLD}[2/4] Virtual environment already exists at $VENV_DIR, recreating...${RESET}"
+    echo -e "${GOLD}[2/3] Virtual environment already exists at $VENV_DIR, recreating...${RESET}"
     rm -rf "$VENV_DIR"
 fi
 echo ""
-echo -e "${GOLD}[2/4] Creating virtual environment...${RESET}"
+echo -e "${GOLD}[2/3] Creating virtual environment...${RESET}"
 python3 -m venv "$VENV_DIR"
 
 # Activate and install Python packages
 echo ""
-echo -e "${GOLD}[3/4] Installing Python dependencies...${RESET}"
+echo -e "${GOLD}[3/3] Installing Python dependencies...${RESET}"
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
 pip install -r "$SCRIPT_DIR/requirements.txt"
@@ -82,41 +78,23 @@ echo "  Preparing launcher script..."
 sed -i 's/\r$//' "$SCRIPT_DIR/launcher.sh"
 chmod +x "$SCRIPT_DIR/launcher.sh"
 
-# Disable systemd service if it exists (we use desktop autostart instead)
-echo ""
-echo -e "${GOLD}[4/4] Configuring desktop autostart...${RESET}"
-if systemctl is-enabled "${SERVICE_NAME}.service" 2>/dev/null; then
-    echo "  Disabling systemd service (using desktop autostart instead)..."
-    sudo systemctl disable "${SERVICE_NAME}.service" 2>/dev/null || true
+# Remove legacy desktop autostart if a previous installer version created it
+AUTOSTART_FILE="$HOME/.config/autostart/kalshi-trader.desktop"
+if [ -f "$AUTOSTART_FILE" ]; then
+    echo "  Removing legacy autostart: $AUTOSTART_FILE"
+    rm -f "$AUTOSTART_FILE"
 fi
-
-# Install desktop autostart: terminal opens on login and runs the bot
-AUTOSTART_DIR="$HOME/.config/autostart"
-mkdir -p "$AUTOSTART_DIR"
-AUTOSTART_FILE="$AUTOSTART_DIR/kalshi-trader.desktop"
-# Use launcher.sh so it uses the venv and runs main.py
-# Launch lxterminal with a title, then maximize it after a short delay
-cat > "$AUTOSTART_FILE" <<EOF
-[Desktop Entry]
-Type=Application
-Name=${DISPLAY_NAME}
-Comment=Run ${DISPLAY_NAME} in a terminal window
-Exec=bash -c 'lxterminal -t "${DISPLAY_NAME}" -e "cd $SCRIPT_DIR && $SCRIPT_DIR/launcher.sh; exec bash" & sleep 2 && wmctrl -r "${DISPLAY_NAME}" -b add,maximized_vert,maximized_horz'
-X-GNOME-Autostart-enabled=true
-EOF
-echo "  Created $AUTOSTART_FILE"
 
 echo ""
 echo -e "${GOLD}=========================================${RESET}"
 echo -e "${GOLD}  Installation complete!${RESET}"
 echo -e "${GOLD}=========================================${RESET}"
 echo ""
-echo "  On desktop login, a terminal will open and run ${DISPLAY_NAME}."
+echo "  No GUI terminal autostart is configured (headless-friendly)."
 echo ""
-echo -e "${GOLD}  Requirements:${RESET}"
-echo "    - Raspberry Pi OS with Desktop"
-echo "    - Desktop Autologin enabled (raspi-config → Boot → Desktop Autologin)"
-echo ""
-echo -e "${GOLD}  To run manually:${RESET}"
+echo -e "${GOLD}  To run the bot:${RESET}"
 echo "    cd $SCRIPT_DIR && .venv/bin/python main.py"
+echo "    # or: $SCRIPT_DIR/launcher.sh"
+echo ""
+echo -e "${GOLD}  Headless:${RESET} use a systemd unit, cron, or your supervisor to run the command above."
 echo ""

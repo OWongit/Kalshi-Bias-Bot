@@ -15,7 +15,6 @@ import atexit
 import csv
 import json
 import os
-import random
 import signal
 import sys
 from datetime import date, datetime, timedelta
@@ -48,43 +47,46 @@ C = {
 # ---------------------------------------------------------------------------
 # Configuration — edit these values directly
 # ---------------------------------------------------------------------------
-DATA_DIR = "calibration/past_data/KXSOL15M"
+DATA_DIR = "calibration/past_data/KXNBAGAME"
 # Only include markets whose ticker encodes an event date in the last N calendar
 # days (inclusive of today). None = all markets with a CSV.
-LOOKBACK_DAYS = 500    # e.g. 5, 7, or 50
-ENTRY_MIN = 98        # Lowest entry_price to test
-ENTRY_MAX = 98          # Highest entry_price to test 
+LOOKBACK_DAYS = None    # e.g. 5, 7, or 50
+ENTRY_MIN = 80       # Lowest entry_price to test
+ENTRY_MAX = 99          # Highest entry_price to test 
 STOP_MIN = 0            # Lowest stop_loss to test
 STOP_MAX = 0            # Highest stop_loss to test
 # MAX_SPREAD_LIST = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 50, 75, 76, 77, 78, 79, 80, 81, 82, 83,99]
-MAX_SPREAD_LIST = [2]  # Max bid-ask spread values to test (cents)
-MIN_OPEN_INTEREST_LIST = [8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000]  # Open interest thresholds to test (None = no filter)
-#MIN_OPEN_INTEREST_LIST = [None]  # Open interest thresholds to test (None = no filter)
+MAX_SPREAD_LIST = [1]  # Max bid-ask spread values to test (cents)
+# MIN_OPEN_INTEREST_LIST = [8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000]  # Open interest thresholds to test (None = no filter)
+MIN_OPEN_INTEREST_LIST = [5000]  # Open interest thresholds to test (None = no filter)
 COOLDOWN_SECONDS_LIST = [0]  # Cooldown values to test (seconds after stop-loss)
 # Three separate strings — NOT one string like "yes, no, both" (that would be a single invalid side).
-SIDE_LIST = ["yes", "no", "both"]  # Each value is swept as its own row
+SIDE_LIST = ["both"]    # Each value is swept as its own row
 TOP_N = 20              # Number of top results to display
-TOP_N_TO_TEST = 5      # Number of top configs to test on test set (when SETTING="both")
+TOP_N_TO_TEST = 5       # Number of top configs to test on test set (when SETTING="both")
 RESULTS_DIR = "calibration/sweep_results"
 
 SETTING = "both"       # "training" | "testing" | "both"
-TRAIN_RATIO = 0.7      # Fraction of markets for training
-SPLIT_SEED = 45   # For reproducible random split
+TRAIN_RATIO = 0.7      # Oldest fraction of markets (by ticker event date) → train; rest → test
 BEST_PARAMS_FILE = "calibration/sweep_results/best_params.json"
 
 
 def _split_tickers(
     data_dir: str,
     train_ratio: float,
-    seed: int,
     lookback_days: int | None = None,
     as_of: date | None = None,
 ) -> tuple[set[str], set[str]]:
-    """Split tickers into train/test sets. Only includes tickers with CSV files.
+    """Split tickers into train (older events) and test (more recent).
 
-    If *lookback_days* is a positive int, only tickers whose event date (parsed
-    from the filename, ``-YYMONDD...``) falls in the last *lookback_days* calendar
-    days (inclusive of *as_of*, default today) are eligible.
+    Only includes tickers with CSV files. If *lookback_days* is a positive int,
+    only tickers whose event date (parsed from the ticker, ``-YYMONDD...``) falls
+    in the last *lookback_days* calendar days (inclusive of *as_of*, default
+    today) are eligible.
+
+    Eligible tickers are sorted by event date ascending (oldest first). The first
+    *train_ratio* fraction is training; the remainder is test. Tickers with no
+    parseable event date are sorted after all dated tickers (usually in test).
     """
     manifest = load_markets_manifest(data_dir)
     ref = as_of or date.today()
@@ -102,8 +104,14 @@ def _split_tickers(
             if ev is None or ev < cutoff:
                 continue
         tickers.append(t)
-    rng = random.Random(seed)
-    rng.shuffle(tickers)
+
+    def _chronological_key(ticker: str) -> tuple[int, date]:
+        ev = parse_event_date_from_ticker(ticker)
+        if ev is None:
+            return (1, date.max)
+        return (0, ev)
+
+    tickers.sort(key=_chronological_key)
     n_train = max(1, int(len(tickers) * train_ratio))
     train_tickers = set(tickers[:n_train])
     test_tickers = set(tickers[n_train:])
@@ -162,6 +170,11 @@ def _format_results_txt(results: list[dict], settings: dict, top: int,
         lines.append(f"  Train markets:      {settings['train_markets']}")
     if "test_markets" in settings:
         lines.append(f"  Test markets:       {settings['test_markets']}")
+    if settings.get("train_ratio") is not None:
+        tr = settings["train_ratio"]
+        lines.append(
+            f"  Train/test split:   chronological by event date (oldest {tr:.0%} → train, rest → test)"
+        )
     lines.append(f"  Entry range:        {settings['entry_min']}–{settings['entry_max']}")
     lines.append(f"  Stop-loss range:    {settings['stop_min']}–{settings['stop_max']}")
     lines.append(f"  Max spread list:   {settings['max_spread_list']}¢")
@@ -197,7 +210,7 @@ def _format_results_txt(results: list[dict], settings: dict, top: int,
             f"  {rank:4d}  {side_str:>4s}  {r['entry_price']:5d}¢ {r['stop_loss']:4d}¢ "
             f" {r['cooldown_seconds']:4d}s  {r['max_spread']:5d}¢  {moi_str}  {r['composite_score']:9.2f}  "
             f"{r['pct_return']:+6.2f}%  {ci_str:>14s}  {r['sharpe_like']:6.2f}  {r['t_stat']:6.2f}  "
-            f"{r['total_pnl']:+7d}¢  {r['total_cost']:7d}¢  {r['total_trades']:6d}  "
+            f"{r['total_pnl']:+8.2f}¢  {r['total_cost']:8.2f}¢  {r['total_trades']:6d}  "
             f"{r['win_rate']:6.1f}%"
         )
 
@@ -235,7 +248,7 @@ def _run_training(data_dir: str, train_tickers: set[str], settings: dict,
     print(f"  Data dir:   {data_dir}")
     if settings.get("lookback_days") is not None:
         print(f"  Lookback:   last {settings['lookback_days']} calendar day(s)")
-    print(f"  Test markets (held out): {settings['test_markets']}")
+    print(f"  Test markets (held out, more recent): {settings['test_markets']}")
     print(f"  Max spread list: {settings['max_spread_list']}¢  min_oi_list: {settings['min_oi_list']}  "
           f"cooldown: {settings['cooldown_list']}  side: {settings.get('side_list', ['no'])}\n")
 
@@ -366,7 +379,7 @@ def _print_results_table(results: list[dict], top: int, title: str) -> None:
             f"  {rank_style}{rank:4d}{rank_reset}  {side_str:>4s}  {r['entry_price']:5d}¢ {r['stop_loss']:4d}¢ "
             f" {r['cooldown_seconds']:4d}s  {max_spread:5d}¢  {moi_str}  {comp_color}{r['composite_score']:9.2f}{C['reset']}  "
             f"{_fmt_num(r['pct_return'], suffix='%')}  {ci_str}  {sharpe_str}  {tstat_str}  "
-            f"{_fmt_num(r['total_pnl'], '+7d', suffix='¢')}  {r['total_cost']:7d}¢  {r['total_trades']:6d}  "
+            f"{_fmt_num(r['total_pnl'], '+8.2f', suffix='¢')}  {r['total_cost']:8.2f}¢  {r['total_trades']:6d}  "
             f"{r['win_rate']:6.1f}%"
         )
     print(f"{sep}\n")
@@ -387,7 +400,6 @@ def main():
     results_dir = RESULTS_DIR
     setting = SETTING
     train_ratio = TRAIN_RATIO
-    split_seed = SPLIT_SEED
     best_params_file = BEST_PARAMS_FILE
     lookback_days = LOOKBACK_DAYS
 
@@ -403,7 +415,7 @@ def main():
             )
 
     train_tickers, test_tickers = _split_tickers(
-        data_dir, train_ratio, split_seed, lookback_days=lookback_days,
+        data_dir, train_ratio, lookback_days=lookback_days,
     )
     if not train_tickers and not test_tickers:
         raise SystemExit(
@@ -412,8 +424,8 @@ def main():
         )
     print(
         f"{C['cyan']}Markets used —{C['reset']} "
-        f"training: {C['bold']}{len(train_tickers)}{C['reset']}, "
-        f"testing: {C['bold']}{len(test_tickers)}{C['reset']}\n"
+        f"training: {C['bold']}{len(train_tickers)}{C['reset']} (older by event date), "
+        f"testing: {C['bold']}{len(test_tickers)}{C['reset']} (more recent)\n"
     )
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     slug = os.path.basename(data_dir)
@@ -431,6 +443,7 @@ def main():
         "timestamp": timestamp,
         "train_markets": len(train_tickers),
         "test_markets": len(test_tickers),
+        "train_ratio": train_ratio,
         "lookback_days": lookback_days,
     }
 

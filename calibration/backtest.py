@@ -10,6 +10,12 @@ Usage:
     the series prefix). None = all markets in the folder.
 
 No imports from the parent project — reads only CSV files.
+
+Entry logic mirrors ``trading.place_entry_orders`` / ``_format_limit_price``:
+ask must be in the configured entry price list, spread and OI checks match
+``_check_side_entry``, and simulated fill cost is the **limit** price
+(bid + 0.1¢ on deci-cent-capable books when bid dollars are known, else bid + 1¢),
+same as the live bot’s submitted limit (not the unfilled bid alone).
 """
 
 import csv
@@ -73,20 +79,80 @@ def load_markets_manifest(data_dir: str) -> dict[str, dict]:
     return manifest
 
 
+# Optional CSV columns preserved as strings (Kalshi dollars / structure).
+_CANDLE_STRING_KEYS = frozenset({"price_level_structure"})
+
+
 def load_candles(csv_path: str) -> list[dict]:
-    """Read a market candlestick CSV into a list of dicts with int values."""
+    """Read a market candlestick CSV into a list of dicts.
+
+    Numeric columns use ``_safe_int``. If present, ``price_level_structure`` and
+    columns ending in ``_dollars`` are kept as strings so entry can match live
+    deci-cent limit pricing when those fields were exported.
+    """
     candles: list[dict] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
-            candles.append({k: _safe_int(v) for k, v in row.items()})
-    return candles[:len(candles) -1] #remove the last row because it's incomplete.
+            rec: dict = {}
+            for k, v in row.items():
+                if k in _CANDLE_STRING_KEYS or k.endswith("_dollars"):
+                    s = (v or "").strip()
+                    rec[k] = s if s else None
+                else:
+                    rec[k] = _safe_int(v)
+            candles.append(rec)
+    return candles[: len(candles) - 1]  # last row often incomplete
 
 
-def _try_entry(candle: dict, entry_price: int, max_spread: int,
-               min_open_interest: int | None, side: str) -> int | None:
-    """Check if entry criteria are met for *side* on this candle.
+def _synth_bid_dollars_from_cents(bid_cents: int) -> str:
+    """Dollar string for bid when CSV has no *_dollars column (same scale as API)."""
+    return f"{max(0.0, min(1.0, bid_cents / 100.0)):.4f}"
 
-    Returns the entry cost (bid) in cents if entry qualifies, else None.
+
+def _supports_deci_cent_at_price(structure: str, bid_cents: int) -> bool:
+    """True if market supports 0.1¢ tick at this price level (matches ``trading.py``)."""
+    if structure == "deci_cent":
+        return True
+    if structure == "tapered_deci_cent":
+        return bid_cents < 10 or bid_cents > 90
+    return False
+
+
+def _format_limit_price(
+    bid_cents: int,
+    bid_dollars: str | None,
+    structure: str,
+    offset_deci_cents: bool,
+) -> tuple[int | None, str | None, int | float]:
+    """Limit buy price: bid + 0.1¢ or +1¢ — duplicate of ``trading._format_limit_price``."""
+    if offset_deci_cents and _supports_deci_cent_at_price(structure, bid_cents):
+        if bid_dollars:
+            try:
+                bid_val = float(bid_dollars)
+                limit_val = min(0.99, bid_val + 0.001)
+                price_dollars = f"{limit_val:.4f}"
+                display_price = round(limit_val * 1000) / 10
+                return (round(limit_val * 100), price_dollars, display_price)
+            except (ValueError, TypeError):
+                pass
+        limit_cents = min(99, bid_cents + 1)
+        return (limit_cents, None, limit_cents)
+    limit_cents = max(1, min(99, bid_cents + 1))
+    return (limit_cents, None, limit_cents)
+
+
+def _try_entry(
+    candle: dict,
+    entry_prices: list[int],
+    max_spread: int,
+    min_open_interest: int | None,
+    side: str,
+) -> int | float | None:
+    """Entry gate + limit price — matches ``trading._check_side_entry`` + limit math.
+
+    Uses candle *close* bid/ask as the snapshot (analogous to REST prices at poll).
+    Returns the **limit** price in cents (may be fractional to 0.1¢) that live code
+    would submit via ``_format_limit_price``, or None if no entry.
     """
     if side == "no":
         yes_bid_close = candle.get("yes_bid_close")
@@ -95,13 +161,15 @@ def _try_entry(candle: dict, entry_price: int, max_spread: int,
             return None
         ask_close = 100 - yes_bid_close
         bid_close = 100 - yes_ask_close
+        bid_dollars_raw = candle.get("no_bid_dollars")
     else:
         ask_close = candle.get("yes_ask_close")
         bid_close = candle.get("yes_bid_close")
         if ask_close is None or bid_close is None:
             return None
+        bid_dollars_raw = candle.get("yes_bid_dollars")
 
-    if ask_close != entry_price:
+    if ask_close not in entry_prices:
         return None
     if ask_close - bid_close > max_spread:
         return None
@@ -111,16 +179,24 @@ def _try_entry(candle: dict, entry_price: int, max_spread: int,
         oi = candle.get("open_interest") or 0
         if oi < min_open_interest:
             return None
-    vol = candle.get("volume") or 0
-    if vol <= 0:
-        return None
-    return bid_close
+
+    raw_struct = candle.get("price_level_structure")
+    if isinstance(raw_struct, str) and raw_struct.strip():
+        structure = raw_struct.strip()
+    else:
+        structure = "linear_cent"
+
+    bid_dollars = bid_dollars_raw if bid_dollars_raw else _synth_bid_dollars_from_cents(bid_close)
+    _lc, _ld, display_price = _format_limit_price(
+        bid_close, bid_dollars, structure, offset_deci_cents=True
+    )
+    return display_price
 
 
 def simulate_market(
     candles: list[dict],
     result: str,
-    entry_price: int,
+    entry_price: int | list[int],
     stop_loss: int,
     max_spread: int,
     min_open_interest: int | None = None,
@@ -130,6 +206,8 @@ def simulate_market(
     """Simulate the entry/stop-loss strategy on one market's candle series.
 
     Args:
+        entry_price: Ask (cents) must be in this set — same as ``params['entry_price']``
+            in live config. Pass a single int or a list of ints.
         side: "yes", "no", or "both".  For "both", each candle checks NO
               first, then YES; once holding, stop/settlement follows the
               entered side.
@@ -139,9 +217,13 @@ def simulate_market(
     """
     trades: list[dict] = []
     holding = False
-    entry_cost = 0
+    entry_cost: int | float = 0
     entry_side = ""
     cooldown_until = 0
+
+    entry_prices: list[int] = (
+        list(entry_price) if isinstance(entry_price, list) else [entry_price]
+    )
 
     sides_to_check = ["no", "yes"] if side == "both" else [side]
 
@@ -154,14 +236,6 @@ def simulate_market(
             continue
 
         if holding:
-            vol = candle.get("volume") or 0
-            if vol <= 0:
-                continue
-            if min_open_interest is not None:
-                oi = candle.get("open_interest") or 0
-                if oi < min_open_interest:
-                    continue
-
             if entry_side == "no":
                 yes_ask_high = candle.get("yes_ask_high")
                 bid_low = (100 - yes_ask_high) if yes_ask_high is not None else (100 - yes_ask_close)
@@ -170,7 +244,7 @@ def simulate_market(
                 bid_low = yes_bid_low if yes_bid_low is not None else yes_bid_close
 
             if stop_loss and bid_low <= stop_loss:
-                pnl = stop_loss - entry_cost
+                pnl = float(stop_loss) - float(entry_cost)
                 trades.append({
                     "entry_cost": entry_cost,
                     "exit_price": stop_loss,
@@ -185,8 +259,9 @@ def simulate_market(
             if ts < cooldown_until:
                 continue
             for s in sides_to_check:
-                cost = _try_entry(candle, entry_price, max_spread,
-                                  min_open_interest, s)
+                cost = _try_entry(
+                    candle, entry_prices, max_spread, min_open_interest, s,
+                )
                 if cost is not None:
                     entry_cost = cost
                     entry_side = s
@@ -195,7 +270,8 @@ def simulate_market(
 
     if holding:
         won = (result == entry_side)
-        pnl = (100 - entry_cost) if won else (0 - entry_cost)
+        ec = float(entry_cost)
+        pnl = (100.0 - ec) if won else (0.0 - ec)
         trades.append({
             "entry_cost": entry_cost,
             "exit_price": 100 if won else 0,
@@ -207,7 +283,7 @@ def simulate_market(
     return trades
 
 
-def _compute_composite_stats(market_stats: list[dict], entry_price: int) -> dict:
+def _compute_composite_stats(market_stats: list[dict]) -> dict:
     """Compute composite score statistics from per-market pnl/win stats.
 
     market_stats: list of dicts with keys: ticker, pnl, cost, trades, wins, losses
@@ -284,7 +360,7 @@ def _compute_composite_stats(market_stats: list[dict], entry_price: int) -> dict
 
 def run_backtest(
     data_dir: str,
-    entry_price: int,
+    entry_price: int | list[int],
     stop_loss: int,
     max_spread: int,
     min_open_interest: int | None = None,
@@ -302,6 +378,11 @@ def run_backtest(
     (inclusive of *as_of*, default today) are included.
 
     Returns a summary dict with aggregate stats.
+
+    ``entry_price`` may be a single int or a list of ints (same as live
+    ``params['entry_price']``). Entry cost in each trade is the **limit** price
+    the bot would submit, not the bid alone; live fills can still be better than
+    the limit (price improvement), which CSV backtests do not model.
     """
     manifest = load_markets_manifest(data_dir)
     ref = as_of or date.today()
@@ -341,7 +422,7 @@ def run_backtest(
             pct = (mkt_pnl / mkt_cost * 100) if mkt_cost else 0.0
             print(
                 f"  {ticker:40s}  trades={len(trades):3d}  "
-                f"pnl={mkt_pnl:+6d}¢  cost={mkt_cost:6d}¢  "
+                f"pnl={mkt_pnl:+8.2f}¢  cost={mkt_cost:8.2f}¢  "
                 f"return={pct:+.1f}%  W/L={mkt_wins}/{mkt_losses}"
             )
 
@@ -354,7 +435,7 @@ def run_backtest(
             "losses": mkt_losses,
         })
 
-    composite = _compute_composite_stats(market_stats, entry_price)
+    composite = _compute_composite_stats(market_stats)
 
     total_trades = sum(m["trades"] for m in market_stats)
     total_pnl = sum(m["pnl"] for m in market_stats)
@@ -384,7 +465,7 @@ def run_backtest(
 def run_backtest_single(
     csv_path: str,
     result: str,
-    entry_price: int,
+    entry_price: int | list[int],
     stop_loss: int,
     max_spread: int,
     min_open_interest: int | None = None,
@@ -397,7 +478,7 @@ def run_backtest_single(
     Args:
         csv_path:    Path to a market candlestick CSV.
         result:      Settlement result for this market ("yes" or "no").
-        entry_price: Ask must equal this to enter (cents).
+        entry_price: Ask (cents) must be in this set — int or list of ints, like live ``entry_price``.
         stop_loss:   Sell when bid drops to this (cents).
         max_spread:  Max bid-ask spread for entry (cents).
         min_open_interest: Skip candles with open_interest below this (None = no filter).
@@ -422,16 +503,16 @@ def run_backtest_single(
 
     if verbose:
         print(f"\nBacktest (single): {ticker}  side={side}")
-        print(f"  Result: {result}  |  entry={entry_price}¢  "
+        print(f"  Result: {result}  |  entry_prices={entry_price!r}¢  "
               f"stop_loss={stop_loss}¢  max_spread={max_spread}¢\n")
         for j, t in enumerate(trades, 1):
             t_side = t.get('side', side)
             print(f"  Trade {j}: {t_side.upper()} buy @ {t['entry_cost']}¢  "
-                  f"exit @ {t['exit_price']}¢  pnl={t['pnl']:+d}¢  "
+                  f"exit @ {t['exit_price']}¢  pnl={t['pnl']:+.2f}¢  "
                   f"({t['exit_reason']})")
         print(f"\n  Total trades:   {len(trades)}")
-        print(f"  Total P/L:      {total_pnl:+d}¢ (${total_pnl/100:+.2f})")
-        print(f"  Total cost:     {total_cost}¢ (${total_cost/100:.2f})")
+        print(f"  Total P/L:      {total_pnl:+.2f}¢ (${total_pnl/100:+.2f})")
+        print(f"  Total cost:     {total_cost:.2f}¢ (${total_cost/100:.2f})")
         print(f"  Percent return: {pct_return:+.2f}%")
         print(f"  Wins / Losses:  {wins} / {losses}")
         print(f"  Win rate:       {win_rate:.1f}%\n")
@@ -493,7 +574,7 @@ def main():
 
     # Full directory mode
     data_dir = DATA_DIR
-    print(f"\nBacktest: side={side}  entry={entry_price}¢  stop_loss={stop_loss}¢  "
+    print(f"\nBacktest: side={side}  entry_prices={entry_price!r}¢  stop_loss={stop_loss}¢  "
           f"max_spread={max_spread}¢  min_open_interest={min_oi}  "
           f"cooldown={cooldown}s")
     print(f"Data dir: {data_dir}")
@@ -511,8 +592,8 @@ def main():
     print(f"\n{'='*70}")
     print(f"  Side:           {side}")
     print(f"  Total trades:   {summary['total_trades']}")
-    print(f"  Total P/L:      {summary['total_pnl']:+d}¢ (${summary['total_pnl']/100:+.2f})")
-    print(f"  Total cost:     {summary['total_cost']}¢ (${summary['total_cost']/100:.2f})")
+    print(f"  Total P/L:      {summary['total_pnl']:+.2f}¢ (${summary['total_pnl']/100:+.2f})")
+    print(f"  Total cost:     {summary['total_cost']:.2f}¢ (${summary['total_cost']/100:.2f})")
     print(f"  Percent return: {summary['pct_return']:+.2f}%")
     ci = summary["pct_return_ci_95"]
     print(f"  95% CI (mean):  [{ci[0]:+.2f}%, {ci[1]:+.2f}%]")

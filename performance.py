@@ -27,7 +27,7 @@ from api_client import KalshiClient
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-START_DATE = "2026-3-19"      # Only include activity from this date onward (YYYY-MM-DD)
+START_DATE = "2026-4-10"      # Only include activity from this date onward (YYYY-MM-DD)
 OFFSET_DOLLARS = 0            # Shift the P&L baseline (e.g. initial deposit adjustment)
 PORTFOLIO_ALLOCATION = 0.02   # The % of your account allocated per trade (0.10 = 10%)
 OUTPUT_FILE = "performance.html"

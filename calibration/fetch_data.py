@@ -4,44 +4,8 @@ given series tickers / category slugs and save as CSVs.
 
 Usage:
     python calibration/fetch_data.py KXNCAAMBGAME [SLUG2 ...]
-    python calibration/fetch_data.py kxbtc15m
-    python calibration/fetch_data.py kxeth15m
-    python calibration/fetch_data.py kxxrp15m
-    python calibration/fetch_data.py kxsol15m
-    python calibration/fetch_data.py kxdoge15m
-    python calibration/fetch_data.py kxhype15m
-    python calibration/fetch_data.py kxbnb15m
-
-    python calibration/fetch_data.py kxhighlax
-    
-    python calibration/fetch_data.py kxhighny
-    python calibration/fetch_data.py kxhighmia
-    python calibration/fetch_data.py kxhighchi
-    python calibration/fetch_data.py kxhighden
-    python calibration/fetch_data.py kxhighaus
-    python calibration/fetch_data.py kxhightmin
-    python calibration/fetch_data.py kxhightlv
-    python calibration/fetch_data.py kxhightatl
-    python calibration/fetch_data.py kxlowtnyc
-    python calibration/fetch_data.py kxhightphx
-    python calibration/fetch_data.py kxhightdal
-    python calibration/fetch_data.py kxlowtlax
-    python calibration/fetch_data.py kxhighphil
-    python calibration/fetch_data.py kxhightsea
-    python calibration/fetch_data.py kxlowtbos
-    python calibration/fetch_data.py kxlowtmia
-    python calibration/fetch_data.py kxhightdc
-    python calibration/fetch_data.py kxhightsfo
-    python calibration/fetch_data.py kxhightokc
-    python calibration/fetch_data.py kxlowtchi
-    python calibration/fetch_data.py kxlowtden
-    python calibration/fetch_data.py kxhighthou
-    python calibration/fetch_data.py kxlowtaus
-    python calibration/fetch_data.py kxhightsatx
-    python calibration/fetch_data.py kxhightwdc
-    python calibration/fetch_data.py kxhightnola
-    python calibration/fetch_data.py kxlowtphil
-
+    python calibration/fetch_data.py KXETH15M
+    python calibration/fetch_data.py kxnbagame
     python calibration/fetch_data.py KXNCAAMBGAME --force   # re-download existing
 """
 

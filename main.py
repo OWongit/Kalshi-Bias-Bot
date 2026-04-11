@@ -54,7 +54,10 @@ C = {
 
 
 def _timestamp() -> str:
-    return f"{C['gold']}{datetime.now().strftime('%-I:%M %p')}{C['reset']}"
+    """12-hour clock without leading zero on hour (POSIX ``%-I`` is not valid on Windows)."""
+    now = datetime.now()
+    h12 = now.hour % 12 or 12
+    return f"{C['gold']}{h12}:{now.minute:02d} {now.strftime('%p')}{C['reset']}"
 
 
 def _print_order_placed(ticker: str, count: int, price: int, order_id: str, side: str, dry_run: bool) -> None:
