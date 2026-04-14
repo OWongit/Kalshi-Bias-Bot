@@ -25,7 +25,7 @@ try:
 except ImportError:
     colorama = None
 
-from backtest import load_markets_manifest, parse_event_date_from_ticker, run_backtest
+from backtest_temp import load_markets_manifest, parse_event_date_from_ticker, run_backtest
 
 # ANSI color codes (no-op if colorama not installed on Windows)
 def _c(code: str) -> str:
@@ -47,7 +47,7 @@ C = {
 # ---------------------------------------------------------------------------
 # Configuration — edit these values directly
 # ---------------------------------------------------------------------------
-DATA_DIR = "calibration/past_data/KXNBAGAME"
+DATA_DIR = "calibration/past_data/KXBTC15M"
 # Only include markets whose ticker encodes an event date in the last N calendar
 # days (inclusive of today). None = all markets with a CSV.
 LOOKBACK_DAYS = None    # e.g. 5, 7, or 50
@@ -504,13 +504,18 @@ def main():
     sweep_csv = os.path.join(results_dir, f"{slug}_{timestamp}_train.csv")
     os.makedirs(results_dir, exist_ok=True)
     fieldnames = [
-        "side", "entry_price", "stop_loss", "cooldown_seconds", "max_spread", "min_open_interest", "pct_return",
+        "side", "entry_price", "stop_loss", "cooldown_seconds", "max_spread", "min_open_interest",
+        "pct_return",
         "pct_return_ci_low", "pct_return_ci_high", "median_return",
         "pct_profitable_markets", "sharpe_like", "t_stat", "composite_score",
         "total_pnl", "total_cost", "total_trades", "win_rate",
     ]
     rows_for_csv = [
-        {**r, "pct_return_ci_low": r["pct_return_ci_95"][0], "pct_return_ci_high": r["pct_return_ci_95"][1]}
+        {
+            **r,
+            "pct_return_ci_low": r["pct_return_ci_95"][0],
+            "pct_return_ci_high": r["pct_return_ci_95"][1],
+        }
         for r in results
     ]
     with open(sweep_csv, "w", newline="", encoding="utf-8") as f:

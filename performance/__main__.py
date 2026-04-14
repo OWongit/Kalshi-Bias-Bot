@@ -5,17 +5,23 @@ Fetches fills and settlements from the Kalshi API, computes cumulative P&L,
 and generates an interactive HTML dashboard.
 
 Usage:
-    Edit the configuration section below, then run:
-    python performance.py
+    Edit the configuration section below, then from the repo root run:
+    python -m performance
 """
 
 import csv
+import math
+import os
 import sys
 import time
-import math
 from collections import defaultdict
 from datetime import datetime, timezone, tzinfo
 from zoneinfo import ZoneInfo
+
+_PERF_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_PERF_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import plotly.colors as plc
 import plotly.graph_objects as go
@@ -27,14 +33,52 @@ from api_client import KalshiClient
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-START_DATE = "2026-4-10"      # Only include activity from this date onward (YYYY-MM-DD)
+START_DATE = "2026-4-13"      # Only include activity from this date onward (YYYY-MM-DD)
 OFFSET_DOLLARS = 0            # Shift the P&L baseline (e.g. initial deposit adjustment)
-PORTFOLIO_ALLOCATION = 0.02   # The % of your account allocated per trade (0.10 = 10%)
-OUTPUT_FILE = "performance.html"
-EVENTS_CSV_FILE = "performance_events.csv"
+PORTFOLIO_ALLOCATION = 0.03   # The % of your account allocated per trade (0.10 = 10%)
+OUTPUT_FILE = os.path.join(_PERF_DIR, "performance.html")
+EVENTS_CSV_FILE = os.path.join(_PERF_DIR, "performance_events.csv")
+# One full market ticker per line (same as ``ticker`` in ``performance_events.csv``).
+# Lines starting with # are comments. Matched tickers are still written to the CSV
+# with ``ignored=yes`` but are omitted from ``performance.html``.
+PERFORMANCE_IGNORE_PATH = os.path.join(_PERF_DIR, "performance_ignore.txt")
 # Local timezone for chart times, daily P&L buckets, and hourly frequency (IANA).
 # Must match your wall clock (e.g. America/Los_Angeles if times were ~7h ahead of Pacific).
 HOURLY_FREQUENCY_TIMEZONE = "America/Los_Angeles"
+
+
+def load_performance_ignore_tickers(path: str) -> set[str]:
+    """Load ignore tickers (one per line, ``#`` comments, blank lines skipped)."""
+    out: set[str] = set()
+    if not os.path.isfile(path):
+        return out
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            out.add(raw.upper())
+    return out
+
+
+def _is_ignored_ticker(ticker: str | None, ignored: set[str]) -> bool:
+    """True if *ticker* matches an ignore line (exact, or event is a longer Kalshi suffix).
+
+    Fills/settlements often use the full market ticker (e.g. ``...-26APR131115-15`` for
+    a 15m window). Ignore lines may omit the trailing ``-15`` / ``-30`` segment; those
+    still count as a match when the event ticker starts with ``<line>-``.
+    """
+    if not ticker or not ignored:
+        return False
+    t = ticker.strip().upper()
+    if t in ignored:
+        return True
+    for stem in ignored:
+        if not stem:
+            continue
+        if t.startswith(stem + "-"):
+            return True
+    return False
 
 
 def _resolve_display_timezone() -> tuple[tzinfo, str]:
@@ -173,6 +217,28 @@ def _fill_count(fill: dict) -> int:
     return 0
 
 
+def _fill_fee_cents(fill: dict) -> float:
+    """Exchange fee for this fill in cents (``fee_cost`` is fixed-point dollars string)."""
+    v = fill.get("fee_cost")
+    if v is None or v == "":
+        return 0.0
+    try:
+        return float(str(v)) * 100.0
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _taker_role_summary(taker_flags: set[bool]) -> str:
+    """How buy fills split on ``is_taker``: ``true`` / ``false`` / ``mixed`` / empty."""
+    if not taker_flags:
+        return ""
+    if taker_flags == {True}:
+        return "true"
+    if taker_flags == {False}:
+        return "false"
+    return "mixed"
+
+
 def _parse_fill_ts(fill: dict) -> datetime:
     """Parse the fill timestamp."""
     ts = fill.get("ts") or fill.get("created_time")
@@ -201,23 +267,31 @@ def _parse_settlement_ts(s: dict) -> datetime:
 def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
     """Build realized P&L events: one entry per settled market or sell fill.
 
+    Per-ticker ``fee_cost_cents`` sums all fill ``fee_cost`` values (cents).
+    ``is_taker`` summarizes **buy** fills only: ``true`` / ``false`` / ``mixed``.
+
     Drops events with ``cost_cents == 0``.
     """
     ticker_cost: dict[str, float] = defaultdict(float)  # total spent (cents)
     ticker_buy_count: dict[str, int] = defaultdict(int)  # total contracts bought
     ticker_sell_revenue: dict[str, float] = defaultdict(float)
     ticker_side_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    ticker_fee_cents: dict[str, float] = defaultdict(float)
+    ticker_buy_is_taker: dict[str, set[bool]] = defaultdict(set)
 
     for f in fills:
         ticker = f.get("ticker") or f.get("market_ticker") or ""
         action = f.get("action", "")
         price = _fill_price_cents(f)
         count = _fill_count(f)
+        ticker_fee_cents[ticker] += _fill_fee_cents(f)
         if action == "buy":
             ticker_cost[ticker] += price * count
             ticker_buy_count[ticker] += count
             fill_side = f.get("side", "no")
             ticker_side_counts[ticker][fill_side] += count
+            if f.get("is_taker") is not None:
+                ticker_buy_is_taker[ticker].add(bool(f["is_taker"]))
         elif action == "sell":
             ticker_sell_revenue[ticker] += price * count
 
@@ -253,6 +327,8 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
             "cost_cents": cost,
             "buy_count": ticker_buy_count.get(ticker, 0),
             "fill_side": dominant_side,
+            "fee_cost_cents": round(ticker_fee_cents.get(ticker, 0.0), 6),
+            "is_taker": _taker_role_summary(ticker_buy_is_taker.get(ticker, set())),
         })
 
     for f in fills:
@@ -277,6 +353,8 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
             "cost_cents": sell_cost,
             "buy_count": ticker_buy_count.get(ticker, 0),
             "fill_side": dominant_side,
+            "fee_cost_cents": round(ticker_fee_cents.get(ticker, 0.0), 6),
+            "is_taker": _taker_role_summary(ticker_buy_is_taker.get(ticker, set())),
         })
 
     events.sort(key=lambda e: e["ts"])
@@ -298,29 +376,43 @@ def _csv_derived_percent_gain(cost_cents: float, pnl_cents: float) -> float | st
     return round(((cost_cents + pnl_cents) / cost_cents - 1.0) * 100.0, 6)
 
 
-def write_events_csv(events: list[dict], path: str) -> None:
+def write_events_csv(
+    events: list[dict],
+    path: str,
+    ignore_tickers: set[str] | None = None,
+) -> None:
     """Omits rows with buy_count == 0. Adds contract_cost and percent_gain.
 
-    Excludes columns: ts_utc, ticker, type (ts_local is kept).
+    Excludes columns: ts (UTC), type (ts_local is kept). Full market ``ticker``
+    is written after ``series``, then ``ignored`` (``yes``/``no`` vs
+    ``performance_ignore.txt``). Includes ``fee_cost_cents`` and ``is_taker``
+    from ``build_pnl_events``.
     """
+    if ignore_tickers is None:
+        ignore_tickers = load_performance_ignore_tickers(PERFORMANCE_IGNORE_PATH)
     display_tz, _ = _resolve_display_timezone()
     rows = [e for e in events if int(e.get("buy_count") or 0) != 0]
     derived = ("contract_cost", "percent_gain")
-    _csv_skip_keys = frozenset({"ts", "ticker", "type", *derived})
+    _csv_skip_keys = frozenset({"ts", "type", *derived})
     if rows:
         keys: set[str] = set()
         for e in rows:
             keys |= e.keys()
         keys -= _csv_skip_keys
-        fieldnames = ["ts_local"] + sorted(keys) + list(derived)
+        rest = sorted(k for k in keys if k not in ("series", "ticker", "ignored"))
+        fieldnames = ["ts_local", "series", "ticker", "ignored"] + rest + list(derived)
     else:
         fieldnames = [
             "ts_local",
             "series",
+            "ticker",
+            "ignored",
             "pnl_cents",
             "cost_cents",
             "buy_count",
             "fill_side",
+            "fee_cost_cents",
+            "is_taker",
             "contract_cost",
             "percent_gain",
         ]
@@ -342,6 +434,10 @@ def write_events_csv(events: list[dict], path: str) -> None:
                     row[k] = _csv_derived_contract_cost(cost, bc)
                 elif k == "percent_gain":
                     row[k] = _csv_derived_percent_gain(cost, pnl)
+                elif k == "ignored":
+                    row[k] = (
+                        "yes" if _is_ignored_ticker(e.get("ticker"), ignore_tickers) else "no"
+                    )
                 else:
                     row[k] = e.get(k, "")
             w.writerow(row)
@@ -352,25 +448,55 @@ def write_events_csv(events: list[dict], path: str) -> None:
 # Chart building
 # ---------------------------------------------------------------------------
 
-def build_dashboard(events: list[dict], offset_dollars: float, current_balance: float, alloc_pct: float, output_file: str) -> None:
+def build_dashboard(
+    events: list[dict],
+    offset_dollars: float,
+    current_balance: float,
+    alloc_pct: float,
+    output_file: str,
+    ignore_tickers: set[str] | None = None,
+) -> None:
     if not events:
         print("No data to plot.")
         sys.exit(0)
 
+    if ignore_tickers is None:
+        ignore_tickers = load_performance_ignore_tickers(PERFORMANCE_IGNORE_PATH)
+    n_all = len(events)
+    events = [e for e in events if not _is_ignored_ticker(e.get("ticker"), ignore_tickers)]
+    n_ignored = n_all - len(events)
+    if n_ignored:
+        print(
+            f"  Excluding {n_ignored} event(s) matching {os.path.basename(PERFORMANCE_IGNORE_PATH)} from dashboard",
+        )
+    if not events:
+        print("No data to plot (all events excluded by performance ignore list).")
+        sys.exit(0)
+
     display_tz, display_tz_label = _resolve_display_timezone()
+
+    def _chart_net_pnl_cents(e: dict) -> float:
+        """Gross ``pnl_cents`` minus ``fee_cost_cents`` for $ / return charts only (CSV unchanged).
+
+        Win-rate counts still use gross ``pnl_cents`` so a fee-drained trade stays a win if
+        settlement P&L was positive.
+        """
+        gross = float(e.get("pnl_cents") or 0)
+        fees = float(e.get("fee_cost_cents") or 0)
+        return gross - fees
 
     timestamps = []
     cumulative_pnl = []
     running = offset_dollars * 100 
     for e in events:
-        running += e["pnl_cents"]
+        running += _chart_net_pnl_cents(e)
         timestamps.append(_ts_for_display(e["ts"], display_tz))
         cumulative_pnl.append(running / 100)
 
     daily_pnl: dict[str, float] = defaultdict(float)
     for e in events:
         day = _ts_for_display(e["ts"], display_tz).strftime("%Y-%m-%d")
-        daily_pnl[day] += e["pnl_cents"] / 100
+        daily_pnl[day] += _chart_net_pnl_cents(e) / 100
     daily_dates = sorted(daily_pnl.keys())
     daily_values = [daily_pnl[d] for d in daily_dates]
     daily_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in daily_values]
@@ -381,7 +507,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
     running_cost_for_pct = 0.0
     markets_with_cost = 0
     for e in events:
-        running_pnl_for_pct += e["pnl_cents"]
+        running_pnl_for_pct += _chart_net_pnl_cents(e)
         cost = e.get("cost_cents", 0)
         running_cost_for_pct += cost
         if cost > 0:
@@ -402,7 +528,8 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             continue
         key = (e["series"], _position_side(e))
         series_side_trades[key] += 1
-        if e["pnl_cents"] > 0:
+        # Wins from gross settlement P&L — fees do not flip a correct resolution to a loss.
+        if float(e.get("pnl_cents") or 0) > 0:
             series_side_wins[key] += 1
 
     series_side_expected_lists: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -434,7 +561,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
     series_cost_totals: dict[str, float] = defaultdict(float)
     for e in events:
         ser = e["series"]
-        series_pnl_totals[ser] += float(e.get("pnl_cents") or 0)
+        series_pnl_totals[ser] += _chart_net_pnl_cents(e)
         series_cost_totals[ser] += float(e.get("cost_cents") or 0)
 
     series_pnl_by_row = [series_pnl_totals[s] / 100.0 for s in sorted_series_for_plot]
@@ -474,7 +601,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
             continue
         fs = e.get("fill_side", "no").upper()
         side_trades[fs] += 1
-        if e["pnl_cents"] > 0:
+        if float(e.get("pnl_cents") or 0) > 0:
             side_wins[fs] += 1
 
     all_sides = sorted(side_trades.keys())
@@ -535,7 +662,9 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
 
     if valid_trades:
         # Sum total
-        returns = [(e["pnl_cents"] / e["cost_cents"]) * 100 for e in valid_trades]
+        returns = [
+            (_chart_net_pnl_cents(e) / e["cost_cents"]) * 100 for e in valid_trades
+        ]
         total_trade_return_pct = sum(returns)
         avg_trade_return_pct = total_trade_return_pct / len(valid_trades)
 
@@ -555,7 +684,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
         hourly_buckets = defaultdict(float)
         for e in valid_trades:
             idx = int((e["ts"] - start_ts).total_seconds() / 3600.0)
-            ret = (e["pnl_cents"] / e["cost_cents"]) * 100
+            ret = (_chart_net_pnl_cents(e) / e["cost_cents"]) * 100
             hourly_buckets[idx] += ret
             
         sum_sq = sum(val**2 for val in hourly_buckets.values())
@@ -846,11 +975,15 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
     total_trade_cost = sum(e["cost_cents"] for e in trades)
     avg_total_cost = (total_trade_cost / total_trades / 100) if total_trades > 0 else 0
 
+    total_fee_cents = sum(float(e.get("fee_cost_cents") or 0) for e in trades)
+    total_fees = total_fee_cents / 100.0
+    avg_fee = (total_fee_cents / total_trades / 100.0) if total_trades > 0 else 0.0
+
     total_contracts = sum(e.get("buy_count", 0) for e in trades)
     avg_contract_price = (total_trade_cost / total_contracts) if total_contracts > 0 else 0
     expected_win_rate = avg_contract_price
 
-    wins = sum(1 for e in trades if e["pnl_cents"] > 0)
+    wins = sum(1 for e in trades if float(e.get("pnl_cents") or 0) > 0)
     actual_win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
 
     pnl_color = "#2ecc71" if total_pnl >= 0 else "#e74c3c"
@@ -864,6 +997,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
                 f"P&L: <span style='color:{pnl_color}'>${total_pnl:+,.2f}</span> | "
                 f"Return: <span style='color:{pct_color}'>{last_pct:+.2f}%</span> | "
                 f"Avg Cost: ${avg_total_cost:,.2f} | "
+                f"Total Fee: ${total_fees:,.4f} | Avg Fee: ${avg_fee:,.4f} | "
                 f"Trades: {total_trades}<br>"
                 f"Expected Win Rate: {expected_win_rate:.1f}% | "
                 f"Actual Win Rate: <span style='color:{wr_color}'>{actual_win_rate:.1f}%</span> "
@@ -931,6 +1065,7 @@ def build_dashboard(events: list[dict], offset_dollars: float, current_balance: 
                 f"P&L: ${total_pnl:+,.2f}| "
                 f"Return: {last_pct:+.2f}% | "
                 f"Avg Cost: ${avg_total_cost:,.2f} | "
+                f"Total Fee: ${total_fees:,.2f} | Avg Fee: ${avg_fee:,.2f} | "
                 f"Trades: {total_trades}\n"
                 f"Expected Win Rate: {expected_win_rate:.1f}% | "
                 f"Actual Win Rate: {actual_win_rate:.1f}%"
@@ -969,8 +1104,17 @@ def main() -> None:
     events = build_pnl_events(fills, settlements)
     print(f"  {len(events)} total P&L events")
 
-    write_events_csv(events, EVENTS_CSV_FILE)
-    build_dashboard(events, OFFSET_DOLLARS, current_balance, PORTFOLIO_ALLOCATION, OUTPUT_FILE)
+    ignore_set = load_performance_ignore_tickers(PERFORMANCE_IGNORE_PATH)
+    if ignore_set:
+        print(
+            f"  Loaded {len(ignore_set)} ticker(s) from {os.path.basename(PERFORMANCE_IGNORE_PATH)}",
+        )
+
+    write_events_csv(events, EVENTS_CSV_FILE, ignore_set)
+    build_dashboard(
+        events, OFFSET_DOLLARS, current_balance, PORTFOLIO_ALLOCATION, OUTPUT_FILE,
+        ignore_tickers=ignore_set,
+    )
 
 
 if __name__ == "__main__":

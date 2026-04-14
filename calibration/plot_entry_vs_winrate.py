@@ -1,7 +1,7 @@
 """
 Plot entry price (cents) vs aggregate trade win rate (%) for all markets in a
-data directory. For each entry price, runs the same backtest as ``backtest.py``,
-then draws the win rate with 95%% Wilson (binomial) confidence bands
+data directory. For each entry price, runs ``backtest_temp.run_backtest`` (bid-based
+entry), then draws the win rate with 95%% Wilson (binomial) confidence bands
 (smoothed along entry with a centered moving average) and a reference line
 y = x (win rate %% vs entry %% on the same 0–100 scale).
 
@@ -10,7 +10,6 @@ Usage:
     python calibration/plot_entry_vs_winrate.py calibration/past_data/KXBTC15M
     python calibration/plot_entry_vs_winrate.py --entry-min 85 --entry-max 99 \\
         calibration/past_data/KXETH15M --output my_plot.html
-
 Set DATA_DIR below to run without passing a path on the command line.
 """
 
@@ -26,16 +25,17 @@ if _cal_dir not in sys.path:
     sys.path.insert(0, _cal_dir)
 
 import plotly.graph_objects as go
+from tqdm import tqdm
 
-from backtest import run_backtest
+from backtest_temp import run_backtest
 
 # Defaults (override via CLI)
-DATA_DIR = "calibration/past_data/KXNBAGAME"  # directory with _markets.csv + per-ticker CSVs
+DATA_DIR = "calibration/past_data/kxnbagame"  # directory with _markets.csv + per-ticker CSVs
 ENTRY_MIN = 0
 ENTRY_MAX = 99
 STOP_LOSS = 0
 MAX_SPREAD = 1
-MIN_OPEN_INTEREST = 5000
+MIN_OPEN_INTEREST = 2000
 COOLDOWN_SECONDS = 0
 SIDE = "both"
 LOOKBACK_DAYS = None
@@ -112,9 +112,12 @@ def collect_curve(
     hi: list[float] = []
     ns: list[int] = []
 
-    for ep in range(entry_min, entry_max + 1):
-        if stop_loss and ep <= stop_loss:
-            continue
+    candidates = [
+        ep
+        for ep in range(entry_min, entry_max + 1)
+        if not (stop_loss and ep <= stop_loss)
+    ]
+    for ep in tqdm(candidates, desc="Backtest entries", unit="¢", file=sys.stderr):
         summary = run_backtest(
             data_dir,
             ep,
@@ -220,7 +223,8 @@ def build_figure(
             text=(
                 f"Entry price vs win rate — {slug}<br>"
                 f"<span style=\"font-size:12px;color:#aaa\">"
-                f"{data_dir} · entry {entry_min}–{entry_max}¢ · n points={len(xs)}"
+                f"{data_dir} · entry {entry_min}–{entry_max}¢ · "
+                f"n points={len(xs)}"
                 + (
                     ""
                     if ci_ma_window <= 1
@@ -230,7 +234,7 @@ def build_figure(
             ),
         ),
         xaxis=dict(
-            title="Entry (ask) price (¢)",
+            title="Entry threshold (¢)",
             range=[0, axis_max],
             zeroline=True,
         ),

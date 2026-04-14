@@ -6,6 +6,17 @@ Usage:
     python calibration/fetch_data.py KXNCAAMBGAME [SLUG2 ...]
     python calibration/fetch_data.py KXETH15M
     python calibration/fetch_data.py kxnbagame
+    python calibration/fetch_data.py kxmlbgame
+    python calibration/fetch_data.py kxnhlgame
+    python calibration/fetch_data.py kxeplgame
+    python calibration/fetch_data.py kxbtcd
+    python calibration/fetch_data.py culture
+    python calibration/fetch_data.py kxeplgame
+    python calibration/fetch_data.py kxlolgame
+    python calibration/fetch_data.py tennis
+    python calibration/fetch_data.py mma
+
+    python calibration/fetch_data.py https://kalshi.com/category/sports/tennis
     python calibration/fetch_data.py KXNCAAMBGAME --force   # re-download existing
 """
 
@@ -16,6 +27,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -41,6 +53,44 @@ CANDLE_CSV_COLUMNS = [
 ]
 
 MARKETS_CSV_COLUMNS = ["ticker", "result", "open_time", "close_time"]
+
+
+def _storage_slug(target: str) -> str:
+    """Folder name for a fetch target, preserving the existing past_data layout."""
+    raw = target.strip()
+    if raw.lower().startswith(("http://", "https://")):
+        parsed = urlparse(raw)
+        path = parsed.path.strip("/")
+        if path.lower().startswith("category/"):
+            parts = [p for p in path[len("category/"):].split("/") if p]
+            if parts:
+                return parts[-1].upper()
+    return raw.strip("/").upper()
+
+
+def _write_manifest(slug_dir: str, all_markets_meta: list[dict]) -> str:
+    """Write ``_markets.csv`` for the current dataset and return its path."""
+    manifest_path = os.path.join(slug_dir, "_markets.csv")
+    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MARKETS_CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(all_markets_meta)
+    return manifest_path
+
+
+def _count_market_csv_files(slug_dir: str) -> int:
+    """How many market candle ``*.csv`` files are in *slug_dir* (excludes ``_markets.csv``)."""
+    n = 0
+    try:
+        for name in os.listdir(slug_dir):
+            if not name.endswith(".csv"):
+                continue
+            if name == "_markets.csv":
+                continue
+            n += 1
+    except OSError:
+        pass
+    return n
 
 
 def _dollars_to_cents(val):
@@ -147,105 +197,124 @@ def fetch_settled_markets(client: KalshiClient, series_ticker: str) -> list[dict
     return markets
 
 
-def download_slug(client: KalshiClient, slug: str, cutoff_ts: str, force: bool):
-    """Download candlestick CSVs for every settled market of *slug*."""
-    series_tickers = discover_series_for_slug(client, slug.upper())
-    if not series_tickers:
-        log.warning("No series found for slug '%s'", slug)
-        return
+def download_slug(client: KalshiClient, slug: str, cutoff_ts: str, force: bool) -> bool:
+    """Download candlestick CSVs for every settled market of *slug*.
 
-    slug_dir = os.path.join(PAST_DATA_DIR, slug.upper())
+    Returns True if interrupted by Ctrl+C, else False.
+    """
+    slug_dir = os.path.join(PAST_DATA_DIR, _storage_slug(slug))
     os.makedirs(slug_dir, exist_ok=True)
 
     cutoff_unix = _iso_to_unix(cutoff_ts) if isinstance(cutoff_ts, str) else int(cutoff_ts)
 
     all_markets_meta: list[dict] = []
+    added_file_count = 0
+    interrupted = False
 
-    for series_ticker in series_tickers:
-        markets = fetch_settled_markets(client, series_ticker)
+    try:
+        series_tickers = discover_series_for_slug(client, slug)
+        if not series_tickers:
+            log.warning("No series found for slug '%s'", slug)
+            return False
 
-        for m in markets:
-            ticker = m["ticker"]
-            csv_path = os.path.join(slug_dir, f"{ticker}.csv")
+        for series_ticker in series_tickers:
+            markets = fetch_settled_markets(client, series_ticker)
 
-            result = m.get("result", "")
-            open_time = m.get("open_time", "")
-            close_time = m.get("close_time", "")
+            for m in markets:
+                ticker = m["ticker"]
+                csv_path = os.path.join(slug_dir, f"{ticker}.csv")
+                existed_before = os.path.exists(csv_path)
 
-            all_markets_meta.append({
-                "ticker": ticker,
-                "result": result,
-                "open_time": open_time,
-                "close_time": close_time,
-            })
+                result = m.get("result", "")
+                open_time = m.get("open_time", "")
+                close_time = m.get("close_time", "")
 
-            if os.path.exists(csv_path) and not force:
-                log.debug("Skipping %s (CSV exists)", ticker)
-                continue
+                all_markets_meta.append({
+                    "ticker": ticker,
+                    "result": result,
+                    "open_time": open_time,
+                    "close_time": close_time,
+                })
 
-            try:
-                start_ts = _iso_to_unix(open_time) if open_time else 0
-                end_ts = _iso_to_unix(close_time) if close_time else int(
-                    datetime.now(timezone.utc).timestamp()
+                if os.path.exists(csv_path) and not force:
+                    log.debug("Skipping %s (CSV exists)", ticker)
+                    continue
+
+                try:
+                    start_ts = _iso_to_unix(open_time) if open_time else 0
+                    end_ts = _iso_to_unix(close_time) if close_time else int(
+                        datetime.now(timezone.utc).timestamp()
+                    )
+                except Exception:
+                    log.warning("Cannot parse timestamps for %s; skipping", ticker)
+                    continue
+
+                settle_ts = 0
+                if m.get("settlement_ts"):
+                    try:
+                        settle_ts = _iso_to_unix(m["settlement_ts"])
+                    except Exception:
+                        pass
+
+                use_historical_first = bool(settle_ts and settle_ts < cutoff_unix)
+                candles = None
+
+                if use_historical_first:
+                    try:
+                        candles = client.get_historical_candlesticks(
+                            ticker, start_ts, end_ts, period_interval=1,
+                        )
+                    except Exception:
+                        log.debug("Historical endpoint failed for %s; trying live", ticker)
+
+                if candles is None:
+                    try:
+                        candles = client.get_candlesticks(
+                            series_ticker, ticker, start_ts, end_ts, period_interval=1,
+                        )
+                    except Exception:
+                        log.debug("Live endpoint failed for %s; trying historical", ticker)
+
+                if candles is None and not use_historical_first:
+                    try:
+                        candles = client.get_historical_candlesticks(
+                            ticker, start_ts, end_ts, period_interval=1,
+                        )
+                    except Exception:
+                        pass
+
+                if candles is None:
+                    log.warning("Could not fetch candlesticks for %s from either endpoint", ticker)
+                    time.sleep(0.05)
+                    continue
+
+                with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(CANDLE_CSV_COLUMNS)
+                    for c in candles:
+                        writer.writerow(flatten_candle(c))
+
+                if (not existed_before) and len(candles) > 0:
+                    added_file_count += 1
+                file_count = _count_market_csv_files(slug_dir)
+                log.info(
+                    "File count: %d | Saved %d candles -> %s",
+                    file_count, len(candles), csv_path,
                 )
-            except Exception:
-                log.warning("Cannot parse timestamps for %s; skipping", ticker)
-                continue
-
-            settle_ts = 0
-            if m.get("settlement_ts"):
-                try:
-                    settle_ts = _iso_to_unix(m["settlement_ts"])
-                except Exception:
-                    pass
-
-            use_historical_first = bool(settle_ts and settle_ts < cutoff_unix)
-            candles = None
-
-            if use_historical_first:
-                try:
-                    candles = client.get_historical_candlesticks(
-                        ticker, start_ts, end_ts, period_interval=1,
-                    )
-                except Exception:
-                    log.debug("Historical endpoint failed for %s; trying live", ticker)
-
-            if candles is None:
-                try:
-                    candles = client.get_candlesticks(
-                        series_ticker, ticker, start_ts, end_ts, period_interval=1,
-                    )
-                except Exception:
-                    log.debug("Live endpoint failed for %s; trying historical", ticker)
-
-            if candles is None and not use_historical_first:
-                try:
-                    candles = client.get_historical_candlesticks(
-                        ticker, start_ts, end_ts, period_interval=1,
-                    )
-                except Exception:
-                    pass
-
-            if candles is None:
-                log.warning("Could not fetch candlesticks for %s from either endpoint", ticker)
                 time.sleep(0.05)
-                continue
+    except KeyboardInterrupt:
+        interrupted = True
+        log.warning("Interrupted while processing '%s'; writing partial _markets.csv", slug)
+    finally:
+        manifest_path = _write_manifest(slug_dir, all_markets_meta)
+        log.info("Wrote manifest with %d markets -> %s", len(all_markets_meta), manifest_path)
+        folder_csvs = _count_market_csv_files(slug_dir)
+        log.info(
+            "File count: %d CSV(s) in folder (new this run with >0 candles: %d)",
+            folder_csvs, added_file_count,
+        )
 
-            with open(csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(CANDLE_CSV_COLUMNS)
-                for c in candles:
-                    writer.writerow(flatten_candle(c))
-
-            log.info("Saved %d candles -> %s", len(candles), csv_path)
-            time.sleep(0.05)
-
-    manifest_path = os.path.join(slug_dir, "_markets.csv")
-    with open(manifest_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=MARKETS_CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(all_markets_meta)
-    log.info("Wrote manifest with %d markets -> %s", len(all_markets_meta), manifest_path)
+    return interrupted
 
 
 def main():
@@ -254,7 +323,7 @@ def main():
     )
     parser.add_argument(
         "slugs", nargs="+",
-        help="Series tickers or category slugs (e.g. KXNCAAMBGAME)",
+        help="Series tickers, category slugs, or Kalshi category URLs",
     )
     parser.add_argument(
         "--force", action="store_true",
@@ -270,11 +339,17 @@ def main():
     cutoff_ts = cutoff.get("market_settled_ts", "2000-01-01T00:00:00Z")
     log.info("Cutoff market_settled_ts: %s", cutoff_ts)
 
+    interrupted = False
     for slug in args.slugs:
         log.info("=== Processing slug: %s ===", slug)
-        download_slug(client, slug, cutoff_ts, args.force)
+        interrupted = download_slug(client, slug, cutoff_ts, args.force)
+        if interrupted:
+            break
 
-    log.info("Done.")
+    if interrupted:
+        log.warning("Stopped early after interruption.")
+    else:
+        log.info("Done.")
 
 
 if __name__ == "__main__":

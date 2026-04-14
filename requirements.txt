@@ -2,4 +2,5 @@ requests
 cryptography
 colorama
 plotly
+tqdm
 tzdata

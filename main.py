@@ -21,10 +21,12 @@ from api_client import KalshiClient
 from discovery import discover_all
 from trading import (
     build_candidates,
+    cancel_resting_buys_for_position_tickers,
     compute_order_sizes,
     fetch_prices_batch,
     place_entry_orders,
     run_stop_loss,
+    tickers_with_open_positions,
 )
 
 # Quiet mode: only show placed/sold orders, errors, and balance when orders change
@@ -60,9 +62,30 @@ def _timestamp() -> str:
     return f"{C['gold']}{h12}:{now.minute:02d} {now.strftime('%p')}{C['reset']}"
 
 
-def _print_order_placed(ticker: str, count: int, price: int, order_id: str, side: str, dry_run: bool) -> None:
+def _format_cents_label(cents: float | int) -> str:
+    """Format cents for logs (integer or one decimal for deci-tick)."""
+    c = float(cents)
+    if abs(c - round(c)) < 1e-6:
+        return f"{int(round(c))}¢"
+    return f"{c:.1f}¢"
+
+
+def _print_order_placed(
+    ticker: str,
+    count: int,
+    bid_cents: float,
+    order_cents: float,
+    order_id: str,
+    side: str,
+    dry_run: bool,
+) -> None:
     prefix = f"{C['yellow']}[DRY RUN] " if dry_run else ""
-    print(f"{_timestamp()} {prefix}{C['green']}{C['bold']}BUY {side.upper()}{C['reset']} {ticker} × {count} @ {price}¢  order_id={order_id}")
+    bid_s = _format_cents_label(bid_cents)
+    ord_s = _format_cents_label(order_cents)
+    print(
+        f"{_timestamp()} {prefix}{C['green']}{C['bold']}BUY {side.upper()}{C['reset']} "
+        f"{ticker} × {count}  bid {bid_s}  order {ord_s}  order_id={order_id}"
+    )
 
 
 def _print_order_sold(ticker: str, side: str, qty: int, price: int, order_id: str, dry_run: bool) -> None:
@@ -131,11 +154,13 @@ def main() -> None:
     cooldown_map: dict[str, float] = {}
     # tickers we just placed orders for (avoids duplicates when get_orders lags)
     recently_placed_tickers: set[str] = set()
+    # "{ticker}:{side}" -> last best-bid snapshot (cents); skip entry churn when unchanged
+    last_entry_bid_snap: dict[str, float] = {}
 
     # -- main loop ---------------------------------------------------------
     while True:
         try:
-            _run_iteration(client, cooldown_map, recently_placed_tickers)
+            _run_iteration(client, cooldown_map, recently_placed_tickers, last_entry_bid_snap)
         except KeyboardInterrupt:
             break
         except Exception:
@@ -157,6 +182,7 @@ def _run_iteration(
     client: KalshiClient,
     cooldown_map: dict[str, float],
     recently_placed_tickers: set[str],
+    last_entry_bid_snap: dict[str, float],
 ) -> None:
     now = time.time()
 
@@ -180,12 +206,20 @@ def _run_iteration(
     except Exception:
         log.warning("Failed to fetch open orders; using recently_placed only")
         open_orders = []
-    tickers_with_open_orders: set[str] = {o.get("ticker", "") for o in open_orders if o.get("ticker")}
-
     current_no_tickers: set[str] = set()
     current_yes_tickers: set[str] = set()
     for pos in positions:
         p = pos.get("position", 0)
+        if p is None and pos.get("position_fp") is not None:
+            try:
+                p = float(str(pos["position_fp"]))
+            except (ValueError, TypeError):
+                p = 0
+        else:
+            try:
+                p = float(p) if p is not None else 0.0
+            except (ValueError, TypeError):
+                p = 0.0
         if p < 0:
             current_no_tickers.add(pos["ticker"])
         elif p > 0:
@@ -196,20 +230,16 @@ def _run_iteration(
             series = _extract_series(t)
             ticker_to_params[t] = series_to_params.get(series, defaults)
 
-    # Once the API reports a non-zero position, drop from recently_placed — position
-    # exclusion takes over. Do NOT remove recently_placed when only a resting order
-    # exists: if the order fills before get_positions updates, clearing recently_placed
-    # on "seen in open_orders" leaves a window where neither resting nor position
-    # blocks a second same-market order (duplicate ~2x size).
-    recently_placed_tickers -= current_no_tickers | current_yes_tickers
+    tickers_with_position = tickers_with_open_positions(positions)
 
-    # Exclude open orders and tickers we just placed (handles get_orders / position lag)
-    tickers_with_open_orders = tickers_with_open_orders | recently_placed_tickers
+    # Once the API reports a non-zero position, drop from recently_placed —
+    # position exclusion takes over.
+    recently_placed_tickers -= current_no_tickers | current_yes_tickers
 
     # 3. Fetch prices for all candidate + position tickers
     all_tickers = list(
         {t for t, _, _ in candidates}
-        | {pos["ticker"] for pos in positions if pos.get("position", 0) != 0}
+        | tickers_with_position
     )
     prices = fetch_prices_batch(client, all_tickers) if all_tickers else {}
 
@@ -225,31 +255,40 @@ def _run_iteration(
         prices, candidates, active_cooldowns,
     )
 
-    # 6. Compute order sizes (exclude markets with positions or open orders)
+    # 6. Compute order sizes (never size entry on markets we already hold)
     orders_to_place = compute_order_sizes(
-        balance, qualified, current_no_tickers, current_yes_tickers, tickers_with_open_orders,
+        balance, qualified, tickers_with_position,
         config.MAX_PCT_PER_MARKET, config.MAX_OPEN_POSITIONS,
         config.MIN_CONTRACTS, config.MAX_CONTRACTS,
     )
 
-    # 7. Place entry orders
-    placed = place_entry_orders(
-        client, orders_to_place, prices,
-        config.DRY_RUN,
+    # 6b. Drop any stray resting buys on markets where we already have a position
+    cancel_resting_buys_for_position_tickers(
+        client, open_orders, tickers_with_position, config.DRY_RUN,
     )
-    for ticker, count, price, order_id, side in placed:
-        _print_order_placed(ticker, count, price, order_id, side, config.DRY_RUN)
+
+    # 7. Place entry orders (cancel-replace stale resting buys)
+    placed = place_entry_orders(
+        client, orders_to_place, prices, open_orders,
+        config.DRY_RUN,
+        last_entry_bid_snap,
+        tickers_with_position,
+    )
+    for ticker, count, bid_c, order_c, order_id, side in placed:
+        _print_order_placed(ticker, count, bid_c, order_c, order_id, side, config.DRY_RUN)
     if placed:
-        recently_placed_tickers.update(ticker for ticker, _, _, _, _ in placed)
+        recently_placed_tickers.update(ticker for ticker, _, _, _, _, _ in placed)
         balance = client.get_balance()
         positions = client.get_positions()
         _print_balance_positions(balance, positions)
+
+    tickers_with_position = tickers_with_open_positions(positions)
 
     # 8. Stop-loss: build per-ticker stop_loss map
     stop_loss_map: dict[str, int] = {}
     for pos in positions:
         t = pos.get("ticker", "")
-        if t and pos.get("position", 0) != 0:
+        if t and t in tickers_with_position:
             params = ticker_to_params.get(t, defaults)
             stop_loss_map[t] = params.get("stop_loss", defaults.get("stop_loss", 70))
 

@@ -8,6 +8,9 @@ endpoint the bot uses.
 import base64
 import datetime
 import logging
+import random
+import time
+
 import requests
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
@@ -15,6 +18,11 @@ from cryptography.hazmat.primitives.asymmetric import padding
 log = logging.getLogger(__name__)
 
 API_PREFIX = "/trade-api/v2"
+
+# Transient server / rate-limit responses worth retrying on idempotent GETs.
+_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_GET_MAX_ATTEMPTS = 6
+_GET_BACKOFF_BASE_SEC = 0.4
 
 
 # ---------------------------------------------------------------------------
@@ -129,14 +137,53 @@ class KalshiClient:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{API_PREFIX}{path}"
 
+    def _sleep_before_get_retry(self, attempt: int, resp: requests.Response | None) -> None:
+        """Exponential backoff with small jitter; honors Retry-After when present."""
+        if resp is not None:
+            ra = resp.headers.get("Retry-After")
+            if ra is not None:
+                try:
+                    time.sleep(float(ra))
+                    return
+                except (ValueError, TypeError):
+                    pass
+        delay = _GET_BACKOFF_BASE_SEC * (2**attempt) + random.random() * 0.15
+        time.sleep(delay)
+
     def get(self, path: str, params: dict | None = None):
-        resp = self.session.get(
-            self._url(path),
-            params=params,
-            headers=self._headers("GET", path),
-        )
-        resp.raise_for_status()
-        return resp.json()
+        last_resp: requests.Response | None = None
+        for attempt in range(_GET_MAX_ATTEMPTS):
+            try:
+                resp = self.session.get(
+                    self._url(path),
+                    params=params,
+                    headers=self._headers("GET", path),
+                    timeout=30,
+                )
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if attempt >= _GET_MAX_ATTEMPTS - 1:
+                    raise
+                log.warning("GET %s: %s; retrying (%s/%s)", path, exc, attempt + 1, _GET_MAX_ATTEMPTS)
+                self._sleep_before_get_retry(attempt, None)
+                continue
+            if resp.status_code in _RETRYABLE_STATUSES:
+                last_resp = resp
+                if attempt >= _GET_MAX_ATTEMPTS - 1:
+                    break
+                log.warning(
+                    "GET %s returned HTTP %s; retrying (%s/%s)",
+                    path,
+                    resp.status_code,
+                    attempt + 1,
+                    _GET_MAX_ATTEMPTS,
+                )
+                self._sleep_before_get_retry(attempt, resp)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        if last_resp is not None:
+            last_resp.raise_for_status()
+        raise requests.RequestException(f"GET {path}: exhausted retries without response")
 
     def post(self, path: str, json_body: dict | None = None):
         resp = self.session.post(
@@ -274,6 +321,10 @@ class KalshiClient:
 
     # ---- order helpers ----------------------------------------------------
 
+    def cancel_order(self, order_id: str) -> dict | None:
+        """Cancel a resting order. Returns the (zeroed) order dict, or None."""
+        return self.delete(f"/portfolio/orders/{order_id}")
+
     def create_order(
         self,
         ticker: str,
@@ -300,10 +351,12 @@ class KalshiClient:
             else:
                 body["yes_price_dollars"] = price_dollars
         elif price_cents is not None:
+            # Binary legs are 1–99¢; callers may hit 100 from float rounding.
+            pc = max(1, min(99, int(price_cents)))
             if side == "no":
-                body["no_price"] = price_cents
+                body["no_price"] = pc
             else:
-                body["yes_price"] = price_cents
+                body["yes_price"] = pc
         else:
             raise ValueError("Either price_cents or price_dollars must be provided")
         data = self.post("/portfolio/orders", json_body=body)

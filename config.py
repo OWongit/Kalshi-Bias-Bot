@@ -29,7 +29,7 @@ BASE_URL = "https://api.elections.kalshi.com"
 # Trading Parameters (global fallbacks; per-category overrides in categories.json)
 # ---------------------------------------------------------------------------
 MAX_OPEN_POSITIONS = 100        # Max concurrent markets with an open NO position
-MAX_PCT_PER_MARKET = 0.02       # Fraction of balance allocated per new market
+MAX_PCT_PER_MARKET = 0.03       # Fraction of balance allocated per new market
 MIN_CONTRACTS = 1               # Minimum contracts per order
 MAX_CONTRACTS = 10_000          # Maximum contracts per order
 
@@ -51,17 +51,25 @@ def load_categories_config(filepath: str) -> dict:
     Returns dict with:
       - "defaults": dict of default params
       - "categories": list of category dicts, each with slug + merged params
+
+    Recognised per-category keys (all optional, inherit from defaults):
+      entry_price, stop_loss, max_spread, min_open_interest,
+      stop_out_cooldown_seconds, side, buy_if_bid_gt_entry (bool: True = bid >= entry, False = bid == entry),
+      bid_limit_offset (float, cents — added to best bid for limit price).
     """
     import json
     with open(filepath, encoding="utf-8") as f:
         data = json.load(f)
     defaults = data.get("defaults", {})
     _normalize_entry_price(defaults)
+    defaults.setdefault("buy_if_bid_gt_entry", False)
+    defaults.setdefault("bid_limit_offset", 0.0)
     categories = []
     for cat in data.get("categories", []):
         merged = {**defaults, **{k: v for k, v in cat.items() if k != "slug"}}
         merged["slug"] = cat.get("slug", "")
         _normalize_entry_price(merged)
+        merged["bid_limit_offset"] = float(merged.get("bid_limit_offset", 0.0))
         categories.append(merged)
     return {"defaults": defaults, "categories": categories}
 
