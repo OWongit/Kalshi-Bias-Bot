@@ -13,6 +13,15 @@ chmod +x install.sh
 ./install.sh
 ```
 
+**Service commands:**
+```
+sudo systemctl status kalshi-trading-bot          # is it running?
+sudo systemctl restart kalshi-trading-bot         # restart after code/config changes
+sudo systemctl disable --now kalshi-trading-bot   # stop and disable boot start
+journalctl -u kalshi-trading-bot -f               # follow logs
+
+```
+
 Requires Raspberry Pi OS with Desktop and Desktop Autologin enabled (`raspi-config` → Boot → Desktop Autologin).
 
 **Other platforms:**
