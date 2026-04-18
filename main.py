@@ -152,15 +152,17 @@ def main() -> None:
 
     # ticker -> timestamp when cooldown expires
     cooldown_map: dict[str, float] = {}
-    # tickers we just placed orders for (avoids duplicates when get_orders lags)
-    recently_placed_tickers: set[str] = set()
+    # ticker -> expiry timestamp; excluded from sizing/placement until then.
+    # Protects against duplicate 2x/3x fills when Kalshi's position / orders
+    # endpoints haven't yet reflected a just-placed order.
+    recently_placed_expiry: dict[str, float] = {}
     # "{ticker}:{side}" -> last best-bid snapshot (cents); skip entry churn when unchanged
     last_entry_bid_snap: dict[str, float] = {}
 
     # -- main loop ---------------------------------------------------------
     while True:
         try:
-            _run_iteration(client, cooldown_map, recently_placed_tickers, last_entry_bid_snap)
+            _run_iteration(client, cooldown_map, recently_placed_expiry, last_entry_bid_snap)
         except KeyboardInterrupt:
             break
         except Exception:
@@ -181,10 +183,15 @@ def _extract_series(ticker: str) -> str:
 def _run_iteration(
     client: KalshiClient,
     cooldown_map: dict[str, float],
-    recently_placed_tickers: set[str],
+    recently_placed_expiry: dict[str, float],
     last_entry_bid_snap: dict[str, float],
 ) -> None:
     now = time.time()
+
+    # Drop recently-placed entries whose TTL has expired.
+    expired_rp = [t for t, exp in recently_placed_expiry.items() if now >= exp]
+    for t in expired_rp:
+        del recently_placed_expiry[t]
 
     # 1. Discovery
     candidates, series_to_params = discover_all(
@@ -234,7 +241,16 @@ def _run_iteration(
 
     # Once the API reports a non-zero position, drop from recently_placed —
     # position exclusion takes over.
-    recently_placed_tickers -= current_no_tickers | current_yes_tickers
+    surfaced = current_no_tickers | current_yes_tickers
+    for t in list(recently_placed_expiry):
+        if t in surfaced:
+            del recently_placed_expiry[t]
+
+    # Exclude both real positions and recently-placed (TTL-guarded) tickers
+    # from sizing and placement. Cancellation of orphan resting buys still
+    # uses the true position set only, so we never cancel the order we just
+    # submitted while the exchange is still propagating it.
+    excluded_from_entry = tickers_with_position | set(recently_placed_expiry)
 
     # 3. Fetch prices for all candidate + position tickers
     all_tickers = list(
@@ -255,9 +271,10 @@ def _run_iteration(
         prices, candidates, active_cooldowns,
     )
 
-    # 6. Compute order sizes (never size entry on markets we already hold)
+    # 6. Compute order sizes (never size entry on markets we already hold or
+    #    just placed an order on — TTL guards against API propagation lag).
     orders_to_place = compute_order_sizes(
-        balance, qualified, tickers_with_position,
+        balance, qualified, excluded_from_entry,
         config.MAX_PCT_PER_MARKET, config.MAX_OPEN_POSITIONS,
         config.MIN_CONTRACTS, config.MAX_CONTRACTS,
     )
@@ -272,12 +289,14 @@ def _run_iteration(
         client, orders_to_place, prices, open_orders,
         config.DRY_RUN,
         last_entry_bid_snap,
-        tickers_with_position,
+        excluded_from_entry,
     )
     for ticker, count, bid_c, order_c, order_id, side in placed:
         _print_order_placed(ticker, count, bid_c, order_c, order_id, side, config.DRY_RUN)
     if placed:
-        recently_placed_tickers.update(ticker for ticker, _, _, _, _, _ in placed)
+        ttl_exp = now + config.RECENTLY_PLACED_TTL_SECONDS
+        for ticker, _, _, _, _, _ in placed:
+            recently_placed_expiry[ticker] = ttl_exp
         balance = client.get_balance()
         positions = client.get_positions()
         _print_balance_positions(balance, positions)

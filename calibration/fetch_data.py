@@ -3,6 +3,11 @@ Download historical 1-minute candlestick data for all settled markets of the
 given series tickers / category slugs and save as CSVs.
 
 Usage:
+    python calibration/fetch_data.py KXNCAAMBGAME KXETH15M
+    python calibration/fetch_data.py KXETH15M,KXBTC15M,kxnbagame
+    python calibration/fetch_data.py -t KXETH15M -t KXBTC15M
+    # Multiple targets in one run: all CSVs + one _markets.csv under
+    # calibration/past_data/<TICKER1>_<TICKER2>_...
     python calibration/fetch_data.py KXNCAAMBGAME [SLUG2 ...]
     python calibration/fetch_data.py KXETH15M
     python calibration/fetch_data.py kxnbagame
@@ -10,6 +15,7 @@ Usage:
     python calibration/fetch_data.py kxnhlgame
     python calibration/fetch_data.py kxeplgame
     python calibration/fetch_data.py kxbtcd
+    python calibration/fetch_data.py football
     python calibration/fetch_data.py culture
     python calibration/fetch_data.py kxeplgame
     python calibration/fetch_data.py kxlolgame
@@ -24,6 +30,7 @@ import argparse
 import csv
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -55,6 +62,18 @@ CANDLE_CSV_COLUMNS = [
 MARKETS_CSV_COLUMNS = ["ticker", "result", "open_time", "close_time"]
 
 
+def _expand_fetch_targets(tokens: list[str]) -> list[str]:
+    """Split comma-separated tokens and drop blanks (order preserved)."""
+    out: list[str] = []
+    for raw in tokens:
+        if not raw:
+            continue
+        for part in re.split(r"\s*,\s*", raw.strip()):
+            if part:
+                out.append(part)
+    return out
+
+
 def _storage_slug(target: str) -> str:
     """Folder name for a fetch target, preserving the existing past_data layout."""
     raw = target.strip()
@@ -66,6 +85,12 @@ def _storage_slug(target: str) -> str:
             if parts:
                 return parts[-1].upper()
     return raw.strip("/").upper()
+
+
+def _combined_past_data_dir_basename(targets: list[str]) -> str:
+    """Single ``past_data`` subfolder name listing every CLI target (storage-normalized)."""
+    parts = [_storage_slug(t) for t in targets]
+    return "_".join(parts)
 
 
 def _write_manifest(slug_dir: str, all_markets_meta: list[dict]) -> str:
@@ -197,12 +222,24 @@ def fetch_settled_markets(client: KalshiClient, series_ticker: str) -> list[dict
     return markets
 
 
-def download_slug(client: KalshiClient, slug: str, cutoff_ts: str, force: bool) -> bool:
+def download_slug(
+    client: KalshiClient,
+    slug: str,
+    cutoff_ts: str,
+    force: bool,
+    min_candles: int = 0,
+    slug_dir: str | None = None,
+    write_manifest: bool = True,
+) -> tuple[bool, list[dict]]:
     """Download candlestick CSVs for every settled market of *slug*.
 
-    Returns True if interrupted by Ctrl+C, else False.
+    *slug_dir* — if set, CSVs go here (used when fetching several targets into one folder).
+    *write_manifest* — if False, caller must write ``_markets.csv`` (e.g. merged multi-fetch).
+
+    Returns (interrupted, markets_meta_rows_for_this_slug).
     """
-    slug_dir = os.path.join(PAST_DATA_DIR, _storage_slug(slug))
+    if slug_dir is None:
+        slug_dir = os.path.join(PAST_DATA_DIR, _storage_slug(slug))
     os.makedirs(slug_dir, exist_ok=True)
 
     cutoff_unix = _iso_to_unix(cutoff_ts) if isinstance(cutoff_ts, str) else int(cutoff_ts)
@@ -215,7 +252,7 @@ def download_slug(client: KalshiClient, slug: str, cutoff_ts: str, force: bool) 
         series_tickers = discover_series_for_slug(client, slug)
         if not series_tickers:
             log.warning("No series found for slug '%s'", slug)
-            return False
+            return False, []
 
         for series_ticker in series_tickers:
             markets = fetch_settled_markets(client, series_ticker)
@@ -288,6 +325,14 @@ def download_slug(client: KalshiClient, slug: str, cutoff_ts: str, force: bool) 
                     time.sleep(0.05)
                     continue
 
+                if min_candles > 0 and len(candles) < min_candles:
+                    log.info(
+                        "Skipping %s: %d candles < --min-candles %d",
+                        ticker, len(candles), min_candles,
+                    )
+                    time.sleep(0.05)
+                    continue
+
                 with open(csv_path, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     writer.writerow(CANDLE_CSV_COLUMNS)
@@ -306,15 +351,16 @@ def download_slug(client: KalshiClient, slug: str, cutoff_ts: str, force: bool) 
         interrupted = True
         log.warning("Interrupted while processing '%s'; writing partial _markets.csv", slug)
     finally:
-        manifest_path = _write_manifest(slug_dir, all_markets_meta)
-        log.info("Wrote manifest with %d markets -> %s", len(all_markets_meta), manifest_path)
+        if write_manifest:
+            manifest_path = _write_manifest(slug_dir, all_markets_meta)
+            log.info("Wrote manifest with %d markets -> %s", len(all_markets_meta), manifest_path)
         folder_csvs = _count_market_csv_files(slug_dir)
         log.info(
             "File count: %d CSV(s) in folder (new this run with >0 candles: %d)",
             folder_csvs, added_file_count,
         )
 
-    return interrupted
+    return interrupted, all_markets_meta
 
 
 def main():
@@ -322,14 +368,33 @@ def main():
         description="Download historical candlestick data for settled markets."
     )
     parser.add_argument(
-        "slugs", nargs="+",
-        help="Series tickers, category slugs, or Kalshi category URLs",
+        "slugs", nargs="*",
+        help="Series tickers, category slugs, or Kalshi category URLs (space- or comma-separated)",
+    )
+    parser.add_argument(
+        "-t", "--ticker",
+        action="append",
+        default=None,
+        metavar="SERIES_OR_SLUG",
+        help="Same as positional targets; repeatable (e.g. -t KXETH15M -t KXBTC15M)",
     )
     parser.add_argument(
         "--force", action="store_true",
         help="Re-download even if CSV already exists",
     )
+    parser.add_argument(
+        "--min-candles", type=int, default=0, metavar="N",
+        help="Discard markets with fewer than N candles (CSV not written)",
+    )
     args = parser.parse_args()
+
+    from_flag = list(args.ticker) if args.ticker else []
+    targets = _expand_fetch_targets(list(args.slugs) + from_flag)
+    if not targets:
+        parser.error(
+            "Provide at least one series ticker, slug, or URL "
+            "(positional args and/or -t/--ticker).",
+        )
 
     private_key = config.load_private_key()
     client = KalshiClient(config.BASE_URL, config.API_KEY_ID, private_key)
@@ -340,11 +405,41 @@ def main():
     log.info("Cutoff market_settled_ts: %s", cutoff_ts)
 
     interrupted = False
-    for slug in args.slugs:
+    if len(targets) == 1:
+        slug = targets[0]
         log.info("=== Processing slug: %s ===", slug)
-        interrupted = download_slug(client, slug, cutoff_ts, args.force)
-        if interrupted:
-            break
+        interrupted, _ = download_slug(
+            client, slug, cutoff_ts, args.force, args.min_candles,
+        )
+    else:
+        combined_basename = _combined_past_data_dir_basename(targets)
+        combined_dir = os.path.join(PAST_DATA_DIR, combined_basename)
+        log.info(
+            "=== Multi-target fetch: %d target(s) -> folder %s ===",
+            len(targets), combined_basename,
+        )
+        accumulated_meta: list[dict] = []
+        for slug in targets:
+            log.info("--- Processing slug: %s ---", slug)
+            intr, meta = download_slug(
+                client,
+                slug,
+                cutoff_ts,
+                args.force,
+                args.min_candles,
+                slug_dir=combined_dir,
+                write_manifest=False,
+            )
+            accumulated_meta.extend(meta)
+            if intr:
+                interrupted = True
+                break
+        manifest_path = _write_manifest(combined_dir, accumulated_meta)
+        log.info(
+            "Wrote combined manifest with %d markets -> %s",
+            len(accumulated_meta),
+            manifest_path,
+        )
 
     if interrupted:
         log.warning("Stopped early after interruption.")

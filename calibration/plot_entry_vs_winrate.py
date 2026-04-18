@@ -30,7 +30,7 @@ from tqdm import tqdm
 from backtest_temp import run_backtest
 
 # Defaults (override via CLI)
-DATA_DIR = "calibration/past_data/kxnbagame"  # directory with _markets.csv + per-ticker CSVs
+DATA_DIR = "calibration/past_data/kxbtc15m"  # directory with _markets.csv + per-ticker CSVs
 ENTRY_MIN = 0
 ENTRY_MAX = 99
 STOP_LOSS = 0
@@ -38,7 +38,7 @@ MAX_SPREAD = 1
 MIN_OPEN_INTEREST = 2000
 COOLDOWN_SECONDS = 0
 SIDE = "both"
-LOOKBACK_DAYS = None
+LOOKBACK_DAYS = 20
 # Centered moving-average window for CI upper/lower along entry (odd ≥3, or 1 = raw Wilson)
 CI_MA_WINDOW = 1
 OUTPUT_FILE = "calibration/entry_vs_winrate.html"

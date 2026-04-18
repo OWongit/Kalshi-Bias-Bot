@@ -29,11 +29,16 @@ BASE_URL = "https://api.elections.kalshi.com"
 # Trading Parameters (global fallbacks; per-category overrides in categories.json)
 # ---------------------------------------------------------------------------
 MAX_OPEN_POSITIONS = 100        # Max concurrent markets with an open NO position
-MAX_PCT_PER_MARKET = 0.03       # Fraction of balance allocated per new market
+MAX_PCT_PER_MARKET = 0.05       # Fraction of balance allocated per new market
 MIN_CONTRACTS = 1               # Minimum contracts per order
 MAX_CONTRACTS = 10_000          # Maximum contracts per order
 
 STOP_LOSS_POLL_SECONDS =   0.10     # Sleep between main-loop iterations
+# After placing an entry buy we exclude that ticker from sizing/placement for
+# this many seconds, even if the position/resting-order endpoints haven't yet
+# reflected it. Protects against 2x/3x duplicate fills from Kalshi eventual
+# consistency when the loop polls faster than propagation.
+RECENTLY_PLACED_TTL_SECONDS = 15.0
 DRY_RUN = False                  # True = log orders without sending them
 
 # ----------------------------------------------------------------  -----------

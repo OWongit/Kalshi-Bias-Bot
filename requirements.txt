@@ -4,3 +4,4 @@ colorama
 plotly
 tqdm
 tzdata
+scipy

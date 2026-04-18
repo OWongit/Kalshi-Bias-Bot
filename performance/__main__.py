@@ -26,6 +26,7 @@ if _REPO_ROOT not in sys.path:
 import plotly.colors as plc
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.stats import norm
 
 import config
 from api_client import KalshiClient
@@ -35,16 +36,29 @@ from api_client import KalshiClient
 # ---------------------------------------------------------------------------
 START_DATE = "2026-4-13"      # Only include activity from this date onward (YYYY-MM-DD)
 OFFSET_DOLLARS = 0            # Shift the P&L baseline (e.g. initial deposit adjustment)
-PORTFOLIO_ALLOCATION = 0.03   # The % of your account allocated per trade (0.10 = 10%)
+PORTFOLIO_ALLOCATION = 0.04 # The % of your account allocated per trade (0.10 = 10%)
+STATISTICAL_EDGE_MARGIN_PCT = 0.75  # Slight buffer over 1% for the proportion edge test
 OUTPUT_FILE = os.path.join(_PERF_DIR, "performance.html")
 EVENTS_CSV_FILE = os.path.join(_PERF_DIR, "performance_events.csv")
 # One full market ticker per line (same as ``ticker`` in ``performance_events.csv``).
 # Lines starting with # are comments. Matched tickers are still written to the CSV
 # with ``ignored=yes`` but are omitted from ``performance.html``.
 PERFORMANCE_IGNORE_PATH = os.path.join(_PERF_DIR, "performance_ignore.txt")
+# Series to exclude from both the dashboard and performance stats (case-insensitive).
+# Events with a matching series are still written to the CSV with ``ignored=yes``.
+IGNORE_SERIES: list[str] = ["kxnbagame"]
 # Local timezone for chart times, daily P&L buckets, and hourly frequency (IANA).
 # Must match your wall clock (e.g. America/Los_Angeles if times were ~7h ahead of Pacific).
 HOURLY_FREQUENCY_TIMEZONE = "America/Los_Angeles"
+
+# Series to render in the bottom "entry vs profit" panels (one panel per entry,
+# matched case-insensitively against ``e["series"]`` from ``_extract_series``).
+# ``ENTRY_PROFIT_REFERENCE_CENTS`` is the nominal entry price in cents/contract
+# for that series; points with ``entry_cents < reference - 3`` are hidden.
+# ENTRY_PROFIT_SERIES: list[str] = ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXXRP15M"]
+# ENTRY_PROFIT_REFERENCE_CENTS: list[float] = [97.0, 98.0, 98.0, 97.0]
+ENTRY_PROFIT_SERIES: list[str] = []
+ENTRY_PROFIT_REFERENCE_CENTS: list[float] = []
 
 
 def load_performance_ignore_tickers(path: str) -> set[str]:
@@ -81,6 +95,26 @@ def _is_ignored_ticker(ticker: str | None, ignored: set[str]) -> bool:
     return False
 
 
+def _build_ignore_series_set() -> set[str]:
+    """Normalise ``IGNORE_SERIES`` config list into upper-cased set."""
+    return {s.strip().upper() for s in IGNORE_SERIES if s.strip()}
+
+
+def _is_ignored_event(
+    event: dict,
+    ignore_tickers: set[str],
+    ignore_series: set[str],
+) -> bool:
+    """True when an event should be excluded (by ticker *or* by series)."""
+    if _is_ignored_ticker(event.get("ticker"), ignore_tickers):
+        return True
+    if ignore_series:
+        ser = str(event.get("series", "")).strip().upper()
+        if ser in ignore_series:
+            return True
+    return False
+
+
 def _resolve_display_timezone() -> tuple[tzinfo, str]:
     """IANA zones need the ``tzdata`` package on Windows. Fallback: UTC."""
     key = HOURLY_FREQUENCY_TIMEZONE.strip()
@@ -108,10 +142,37 @@ def _ts_for_display(ts: datetime, tz: tzinfo) -> datetime:
 # API helpers
 # ---------------------------------------------------------------------------
 
+def _config_date_to_utc(s: str) -> datetime:
+    """Parse start date (``YYYY-MM-DD`` or single-digit month/day) at midnight UTC."""
+    raw = s.strip()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        parts = raw.split("-")
+        if len(parts) == 3:
+            y, mo, d = int(parts[0]), int(parts[1]), int(parts[2])
+            return datetime(y, mo, d, tzinfo=timezone.utc)
+        raise
+
+
 def _parse_ts(start_date: str) -> int:
     """Convert YYYY-MM-DD string to Unix timestamp."""
-    dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
+    return int(_config_date_to_utc(start_date).timestamp())
+
+
+def _format_elapsed_since(start: datetime, end: datetime) -> str:
+    """Human-readable wall-clock span (e.g. ``12d 5h 3m``)."""
+    if end < start:
+        return "0m"
+    delta = end - start
+    days = delta.days
+    hours, rem = divmod(delta.seconds, 3600)
+    mins, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h {mins}m"
+    if hours > 0:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
 
 
 def _fetch_paginated(client: KalshiClient, path: str, key: str,
@@ -269,6 +330,7 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
 
     Per-ticker ``fee_cost_cents`` sums all fill ``fee_cost`` values (cents).
     ``is_taker`` summarizes **buy** fills only: ``true`` / ``false`` / ``mixed``.
+    ``buy_filled_ts`` is the earliest buy-fill timestamp for the ticker (UTC).
 
     Drops events with ``cost_cents == 0``.
     """
@@ -278,6 +340,7 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
     ticker_side_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     ticker_fee_cents: dict[str, float] = defaultdict(float)
     ticker_buy_is_taker: dict[str, set[bool]] = defaultdict(set)
+    ticker_first_buy_ts: dict[str, datetime] = {}
 
     for f in fills:
         ticker = f.get("ticker") or f.get("market_ticker") or ""
@@ -292,6 +355,11 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
             ticker_side_counts[ticker][fill_side] += count
             if f.get("is_taker") is not None:
                 ticker_buy_is_taker[ticker].add(bool(f["is_taker"]))
+            if ticker:
+                buy_ts = _parse_fill_ts(f)
+                prev = ticker_first_buy_ts.get(ticker)
+                if prev is None or buy_ts < prev:
+                    ticker_first_buy_ts[ticker] = buy_ts
         elif action == "sell":
             ticker_sell_revenue[ticker] += price * count
 
@@ -311,6 +379,11 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
         if revenue == 0:
             revenue = s.get("revenue", 0) or 0
 
+        buy_count = ticker_buy_count.get(ticker, 0)
+        max_revenue = buy_count * 100
+        if revenue > max_revenue:
+            revenue = max_revenue
+
         cost = ticker_cost.get(ticker, 0)
         sell_rev = ticker_sell_revenue.get(ticker, 0)
         pnl = revenue + sell_rev - cost
@@ -329,6 +402,7 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
             "fill_side": dominant_side,
             "fee_cost_cents": round(ticker_fee_cents.get(ticker, 0.0), 6),
             "is_taker": _taker_role_summary(ticker_buy_is_taker.get(ticker, set())),
+            "buy_filled_ts": ticker_first_buy_ts.get(ticker),
         })
 
     for f in fills:
@@ -355,6 +429,7 @@ def build_pnl_events(fills: list[dict], settlements: list[dict]) -> list[dict]:
             "fill_side": dominant_side,
             "fee_cost_cents": round(ticker_fee_cents.get(ticker, 0.0), 6),
             "is_taker": _taker_role_summary(ticker_buy_is_taker.get(ticker, set())),
+            "buy_filled_ts": ticker_first_buy_ts.get(ticker),
         })
 
     events.sort(key=lambda e: e["ts"])
@@ -380,33 +455,35 @@ def write_events_csv(
     events: list[dict],
     path: str,
     ignore_tickers: set[str] | None = None,
+    ignore_series: set[str] | None = None,
 ) -> None:
     """Omits rows with buy_count == 0. Adds contract_cost and percent_gain.
 
-    Excludes columns: ts (UTC), type (ts_local is kept). Full market ``ticker``
-    is written after ``series``, then ``ignored`` (``yes``/``no`` vs
-    ``performance_ignore.txt``). Includes ``fee_cost_cents`` and ``is_taker``
-    from ``build_pnl_events``.
+    Excludes columns: ts (UTC), type, buy_filled_ts (UTC); the localized
+    ``ts_local`` and ``buy_filled_ts_local`` are written instead. Full market
+    ``ticker`` is written after ``series``, then ``ignored`` (``yes``/``no``
+    vs ``performance_ignore.txt`` and ``IGNORE_SERIES``). Includes
+    ``fee_cost_cents`` and ``is_taker`` from ``build_pnl_events``.
     """
     if ignore_tickers is None:
         ignore_tickers = load_performance_ignore_tickers(PERFORMANCE_IGNORE_PATH)
+    if ignore_series is None:
+        ignore_series = _build_ignore_series_set()
     display_tz, _ = _resolve_display_timezone()
     rows = [e for e in events if int(e.get("buy_count") or 0) != 0]
     derived = ("contract_cost", "percent_gain")
-    _csv_skip_keys = frozenset({"ts", "type", *derived})
+    _csv_skip_keys = frozenset({"ts", "type", "buy_filled_ts", *derived})
+    leading = ("ts_local", "buy_filled_ts_local", "series", "ticker", "ignored")
     if rows:
         keys: set[str] = set()
         for e in rows:
             keys |= e.keys()
         keys -= _csv_skip_keys
-        rest = sorted(k for k in keys if k not in ("series", "ticker", "ignored"))
-        fieldnames = ["ts_local", "series", "ticker", "ignored"] + rest + list(derived)
+        rest = sorted(k for k in keys if k not in leading)
+        fieldnames = list(leading) + rest + list(derived)
     else:
         fieldnames = [
-            "ts_local",
-            "series",
-            "ticker",
-            "ignored",
+            *leading,
             "pnl_cents",
             "cost_cents",
             "buy_count",
@@ -423,25 +500,115 @@ def write_events_csv(
             ts = e["ts"]
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+            buy_ts = e.get("buy_filled_ts")
+            if isinstance(buy_ts, datetime):
+                if buy_ts.tzinfo is None:
+                    buy_ts = buy_ts.replace(tzinfo=timezone.utc)
+                buy_ts_local = _ts_for_display(buy_ts, display_tz).isoformat()
+            else:
+                buy_ts_local = ""
             row: dict[str, object] = {
                 "ts_local": _ts_for_display(ts, display_tz).isoformat(),
+                "buy_filled_ts_local": buy_ts_local,
             }
             cost = float(e.get("cost_cents") or 0)
             pnl = float(e.get("pnl_cents") or 0)
             bc = int(e.get("buy_count") or 0)
             for k in fieldnames[1:]:
+                if k in row:
+                    continue
                 if k == "contract_cost":
                     row[k] = _csv_derived_contract_cost(cost, bc)
                 elif k == "percent_gain":
                     row[k] = _csv_derived_percent_gain(cost, pnl)
                 elif k == "ignored":
                     row[k] = (
-                        "yes" if _is_ignored_ticker(e.get("ticker"), ignore_tickers) else "no"
+                        "yes" if _is_ignored_event(e, ignore_tickers, ignore_series) else "no"
                     )
                 else:
                     row[k] = e.get(k, "")
             w.writerow(row)
     print(f"Events CSV saved to {path} ({len(rows)} rows, buy_count != 0)")
+
+
+def format_win_rate_proportion_edge_line(
+    expected_win_rate_pct: float, 
+    wins: int, 
+    n: int, 
+    margin_pct: float = 0.01
+) -> str:
+    """
+    One-tailed Z-test for proportions with an added margin.
+    Tests if the actual win rate is significantly greater than (expected + margin).
+    """
+    if n <= 0:
+        return (
+            "Statistical Edge: Z-score: n/a | P-value: n/a "
+            "(Not Significant at alpha 0.05)"
+        )
+
+    # Convert percentages to decimals
+    p_base = expected_win_rate_pct / 100.0
+    margin = margin_pct / 100.0
+    
+    # Our new null hypothesis proportion (p0) is the base + margin
+    p0 = p_base + margin
+    
+    # Clamp p0 to prevent math errors near 0 or 1
+    p0 = min(max(p0, 1e-15), 1.0 - 1e-15)
+    
+    phat = wins / n
+    
+    # Calculate Standard Error using the buffered null proportion
+    se = math.sqrt(p0 * (1.0 - p0) / n)
+    
+    if se <= 0.0:
+        return (
+            "Statistical Edge: Z-score: n/a | P-value: n/a "
+            "(Not Significant at alpha 0.05)"
+        )
+
+    # Calculate Z-score: (Actual - (Expected + Buffer)) / SE
+    z = (phat - p0) / se
+    
+    # One-tailed p-value (probability of seeing a result this high by chance)
+    p_value = float(norm.sf(z))
+    
+    verdict = "Significant" if p_value < 0.05 else "Not Significant"
+    
+    margin_str = f" with {margin_pct}% margin"
+    
+    return (
+        f"Statistical Edge{margin_str}: Z-score: {z:.4f} | P-value: {p_value:.6f} "
+        f"({verdict} at alpha 0.05)"
+    )
+
+
+def _sortino_annualized(
+    returns: list[float],
+    start_ts: datetime,
+    end_ts: datetime,
+    mar: float = 0.0,
+) -> float | None:
+    """Annualized Sortino ratio (MAR defaults to 0).
+
+    Returns None when fewer than 2 observations or zero downside deviation.
+    Annualization: sqrt(n / T_years) where T_years is calendar span of events.
+    """
+    n = len(returns)
+    if n < 2:
+        return None
+    mean = sum(returns) / n
+    downside_sq = sum(min(0.0, r - mar) ** 2 for r in returns) / n
+    downside_dev = math.sqrt(downside_sq)
+    if downside_dev < 1e-12:
+        return None
+    t_years = max((end_ts - start_ts).total_seconds() / (365.25 * 24 * 3600), 1e-9)
+    return ((mean - mar) / downside_dev) * math.sqrt(n / t_years)
+
+
+def _fmt_sortino(val: float | None) -> str:
+    return "n/a" if val is None else f"{val:.2f}"
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +622,7 @@ def build_dashboard(
     alloc_pct: float,
     output_file: str,
     ignore_tickers: set[str] | None = None,
+    ignore_series: set[str] | None = None,
 ) -> None:
     if not events:
         print("No data to plot.")
@@ -462,15 +630,17 @@ def build_dashboard(
 
     if ignore_tickers is None:
         ignore_tickers = load_performance_ignore_tickers(PERFORMANCE_IGNORE_PATH)
+    if ignore_series is None:
+        ignore_series = _build_ignore_series_set()
     n_all = len(events)
-    events = [e for e in events if not _is_ignored_ticker(e.get("ticker"), ignore_tickers)]
+    events = [e for e in events if not _is_ignored_event(e, ignore_tickers, ignore_series)]
     n_ignored = n_all - len(events)
     if n_ignored:
         print(
-            f"  Excluding {n_ignored} event(s) matching {os.path.basename(PERFORMANCE_IGNORE_PATH)} from dashboard",
+            f"  Excluding {n_ignored} event(s) matching ignore list(s) from dashboard",
         )
     if not events:
-        print("No data to plot (all events excluded by performance ignore list).")
+        print("No data to plot (all events excluded by ignore lists).")
         sys.exit(0)
 
     display_tz, display_tz_label = _resolve_display_timezone()
@@ -516,6 +686,28 @@ def build_dashboard(
         avg_cost = (running_cost_for_pct / markets_with_cost) if markets_with_cost > 0 else 0
         pct = (running_pnl_for_pct / avg_cost * 100) if avg_cost > 0 else 0.0
         pct_values.append(pct)
+
+    # -- Sortino: per-trade return on cost (for "Cumulative Return %" plot) --
+    pct_sortino_returns: list[float] = []
+    for e in events:
+        cost = float(e.get("cost_cents") or 0)
+        if cost > 0:
+            pct_sortino_returns.append(_chart_net_pnl_cents(e) / cost)
+
+    # -- Sortino: path-dependent equity returns (for "Cumulative P&L ($)" plot) --
+    # ε = $1 (100 cents) prevents division-by-zero when cumulative equity is near 0
+    _EPS_CENTS = 100.0
+    pnl_sortino_returns: list[float] = []
+    equity = offset_dollars * 100
+    for e in events:
+        net = _chart_net_pnl_cents(e)
+        pnl_sortino_returns.append(net / max(abs(equity), _EPS_CENTS))
+        equity += net
+
+    ev_start = events[0]["ts"]
+    ev_end = events[-1]["ts"]
+    sortino_pnl = _sortino_annualized(pnl_sortino_returns, ev_start, ev_end)
+    sortino_pct = _sortino_annualized(pct_sortino_returns, ev_start, ev_end)
 
     def _position_side(e: dict) -> str:
         s = str(e.get("fill_side", "no")).lower()
@@ -719,31 +911,51 @@ def build_dashboard(
     # -----------------------------------------------------------------------
     # Initializing Subplots 
     # -----------------------------------------------------------------------
+    entry_profit_series = list(ENTRY_PROFIT_SERIES)
+    entry_profit_refs = list(ENTRY_PROFIT_REFERENCE_CENTS)
+    if len(entry_profit_refs) != len(entry_profit_series):
+        raise ValueError(
+            "ENTRY_PROFIT_SERIES and ENTRY_PROFIT_REFERENCE_CENTS must have the same length."
+        )
+    n_entry_panels = len(entry_profit_series)
+
+    entry_panel_titles = tuple(
+        f"{ser}: entry vs net P&L / return (≥ {ref - 3:.0f}¢)"
+        for ser, ref in zip(entry_profit_series, entry_profit_refs)
+    )
+    base_row_heights = [0.12, 0.10, 0.10, 0.12, 0.11, 0.10, 0.12, 0.23]
+    entry_row_weight = 0.07
+    scale = 1.0 - entry_row_weight * n_entry_panels
+    scaled_base_heights = [h * scale for h in base_row_heights]
+    row_heights = scaled_base_heights + [entry_row_weight] * n_entry_panels
+    specs = [
+        [{}],
+        [{}],
+        [{}],
+        [{}],
+        [{"secondary_y": True}],
+        [{}],
+        [{}],
+        [{}],
+    ] + [[{"secondary_y": True}] for _ in range(n_entry_panels)]
+
     fig = make_subplots(
-        rows=8,
+        rows=8 + n_entry_panels,
         cols=1,
         subplot_titles=(
-            "Cumulative P&L ($)",
-            "Cumulative Return (%)",
+            f"Cumulative P&L ($) · Sortino {_fmt_sortino(sortino_pnl)}",
+            f"Cumulative Return (%) · Sortino {_fmt_sortino(sortino_pct)}",
             "Daily P&L ($)",
             "Win Rate by Series & side (YES / NO) (%)",
             "P&L ($) & return (%) by series",
             "Win Rate by Side (%)",
             "Trade frequency by hour",
             f"Account Value Projection (Next 30 Days at {alloc_pct*100:.0f}% Alloc)",
+            *entry_panel_titles,
         ),
-        vertical_spacing=0.042,
-        row_heights=[0.12, 0.10, 0.10, 0.12, 0.11, 0.10, 0.12, 0.23],
-        specs=[
-            [{}],
-            [{}],
-            [{}],
-            [{}],
-            [{"secondary_y": True}],
-            [{}],
-            [{}],
-            [{}],
-        ],
+        vertical_spacing=0.032,
+        row_heights=row_heights,
+        specs=specs,
     )
 
     fig.add_trace(
@@ -759,6 +971,13 @@ def build_dashboard(
         row=1, col=1,
     )
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=1, col=1)
+
+    if cumulative_pnl:
+        _yp_lo = min(cumulative_pnl)
+        _yp_hi = max(cumulative_pnl)
+        _yp_span = _yp_hi - _yp_lo
+        _yp_buf = max(_yp_span * 0.06, 1.0)
+        fig.update_yaxes(range=[_yp_lo - _yp_buf, _yp_hi + _yp_buf], row=1, col=1)
 
     last_pct = pct_values[-1] if pct_values else 0
     pct_line_color = "#2ecc71" if last_pct >= 0 else "#e74c3c"
@@ -967,6 +1186,83 @@ def build_dashboard(
     )
 
     # -----------------------------------------------------------------------
+    # ENTRY vs PROFIT PLOTS (rows 9..)
+    # -----------------------------------------------------------------------
+    for i, (target_series, reference_cents) in enumerate(
+        zip(entry_profit_series, entry_profit_refs)
+    ):
+        row_idx = 9 + i
+        target_key = target_series.strip().upper()
+        min_entry_cents = reference_cents - 3.0
+
+        entry_sum_usd: dict[float, float] = defaultdict(float)
+        entry_sum_pct: dict[float, float] = defaultdict(float)
+        entry_trade_counts: dict[float, int] = defaultdict(int)
+        for e in events:
+            if e.get("type") != "settlement":
+                continue
+            cost = float(e.get("cost_cents") or 0)
+            bc = int(e.get("buy_count") or 0)
+            pnl = float(e.get("pnl_cents") or 0)
+            if cost <= 0 or bc <= 0 or pnl == 0:
+                continue
+            if str(e.get("series", "")).strip().upper() != target_key:
+                continue
+            entry_cents = round(cost / bc, 4)
+            if entry_cents < min_entry_cents:
+                continue
+            net_cents = _chart_net_pnl_cents(e)
+            entry_sum_usd[entry_cents] += net_cents / 100.0
+            entry_sum_pct[entry_cents] += net_cents / cost * 100.0
+            entry_trade_counts[entry_cents] += 1
+
+        entry_x = sorted(entry_sum_usd.keys())
+        entry_y_usd = [entry_sum_usd[x] for x in entry_x]
+        entry_y_pct = [entry_sum_pct[x] for x in entry_x]
+        entry_counts = [entry_trade_counts[x] for x in entry_x]
+        usd_colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in entry_y_usd]
+        pct_colors = ["#3498db" if v >= 0 else "#e67e22" for v in entry_y_pct]
+
+        fig.add_trace(
+            go.Scatter(
+                x=entry_x,
+                y=entry_y_usd,
+                mode="markers",
+                marker=dict(size=9, color=usd_colors, opacity=0.85,
+                            line=dict(width=0.5, color="#ecf0f1")),
+                name=f"{target_series} net $",
+                showlegend=False,
+                customdata=entry_counts,
+                hovertemplate=(
+                    "Entry: %{x:.2f}¢<br>"
+                    "Total Net P&L: $%{y:+.2f}<br>"
+                    "Trades: %{customdata}<extra></extra>"
+                ),
+            ),
+            row=row_idx, col=1, secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=entry_x,
+                y=entry_y_pct,
+                mode="markers",
+                marker=dict(size=9, color=pct_colors, opacity=0.85, symbol="diamond",
+                            line=dict(width=0.5, color="#ecf0f1")),
+                name=f"{target_series} net %",
+                showlegend=False,
+                customdata=entry_counts,
+                hovertemplate=(
+                    "Entry: %{x:.2f}¢<br>"
+                    "Total Return: %{y:+.2f}%<br>"
+                    "Trades: %{customdata}<extra></extra>"
+                ),
+            ),
+            row=row_idx, col=1, secondary_y=True,
+        )
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.4,
+                      row=row_idx, col=1)
+
+    # -----------------------------------------------------------------------
     # Global Stats & Text Formatting
     # -----------------------------------------------------------------------
     total_pnl = cumulative_pnl[-1] if cumulative_pnl else 0
@@ -990,10 +1286,28 @@ def build_dashboard(
     pct_color = "#2ecc71" if last_pct >= 0 else "#e74c3c"
     wr_color = "#2ecc71" if actual_win_rate >= expected_win_rate else "#e74c3c"
 
+    stat_edge_line = format_win_rate_proportion_edge_line(
+        expected_win_rate, wins, total_trades, STATISTICAL_EDGE_MARGIN_PCT
+    )
+
+    implied_start_balance = current_balance - total_pnl
+    if implied_start_balance > 1e-9:
+        account_gain_pct = (current_balance / implied_start_balance - 1.0) * 100.0
+        account_gain_fmt = f"{account_gain_pct:+.2f}%"
+        ag_color = "#2ecc71" if account_gain_pct >= 0 else "#e74c3c"
+        account_gain_html = f"<span style='color:{ag_color}'>({account_gain_fmt})</span>"
+    else:
+        account_gain_fmt = "n/a"
+        account_gain_html = f"<span style='color:#b0b0b0'>({account_gain_fmt})</span>"
+
+    start_dt = _config_date_to_utc(START_DATE)
+    elapsed_str = _format_elapsed_since(start_dt, datetime.now(timezone.utc))
+
     fig.update_layout(
         title=dict(
             text=(
-                f"Kalshi Bot Performance | Account Value: ${current_balance:,.2f} | Portfolio Alloc: {alloc_pct*100:.0f}%<br>"
+                f"Kalshi Bot Performance | Account Value: ${current_balance:,.2f} {account_gain_html} | "
+                f"Elapsed: {elapsed_str} | Portfolio Alloc: {alloc_pct*100:.0f}%<br>"
                 f"P&L: <span style='color:{pnl_color}'>${total_pnl:+,.2f}</span> | "
                 f"Return: <span style='color:{pct_color}'>{last_pct:+.2f}%</span> | "
                 f"Avg Cost: ${avg_total_cost:,.2f} | "
@@ -1008,13 +1322,15 @@ def build_dashboard(
                 f"Hourly Gain: {hourly_gain:+.4f}% | "
                 f"Daily Gain: {daily_gain:+.2f}% | "
                 f"Weekly Gain: {weekly_gain:+.2f}%"
-                f"</span><br><br>"
+                f"</span><br>"
+                f"<span style='font-size:14px; color:#c8d6e5; display:block; margin-top:12px; padding-top:6px'>"
+                f"{stat_edge_line}</span><br><br>"
             ),
             font=dict(size=18),
             y=0.98,
         ),
-        height=2880,
-        margin=dict(t=160, b=155),
+        height=int(round(2880 / scale)) if scale > 0 else 2880,
+        margin=dict(t=195, b=155),
         barmode="stack",
         showlegend=True,
         template="plotly_dark",
@@ -1038,6 +1354,12 @@ def build_dashboard(
     # Projection formatting
     fig.update_yaxes(title_text="Projected Value ($)", row=8, col=1)
     fig.update_xaxes(title_text="Days from now", row=8, col=1)
+
+    for i in range(n_entry_panels):
+        row_idx = 9 + i
+        fig.update_xaxes(title_text="Avg entry (¢/contract)", row=row_idx, col=1)
+        fig.update_yaxes(title_text="Net P&L ($)", row=row_idx, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="Return (%)", row=row_idx, col=1, secondary_y=True)
 
     # Legend in the gap between trade frequency (row 7) and projection (row 8)
     y6 = fig.layout.yaxis7.domain
@@ -1074,8 +1396,11 @@ def build_dashboard(
                 f"Avg Trade Return: {avg_trade_return_pct:+.2f}% | "
                 f"Hourly Gain: {hourly_gain:+.4f}% | "
                 f"Daily Gain: {daily_gain:+.2f}% | "
-                f"Weekly Gain: {weekly_gain:+.2f}%"
+                f"Weekly Gain: {weekly_gain:+.2f}%\n"
+                f"Sortino (P&L): {_fmt_sortino(sortino_pnl)} | "
+                f"Sortino (Return): {_fmt_sortino(sortino_pct)}"
             )
+    message += "\n" + stat_edge_line
     print(message)
 
 
@@ -1105,15 +1430,21 @@ def main() -> None:
     print(f"  {len(events)} total P&L events")
 
     ignore_set = load_performance_ignore_tickers(PERFORMANCE_IGNORE_PATH)
+    ignore_series_set = _build_ignore_series_set()
     if ignore_set:
         print(
             f"  Loaded {len(ignore_set)} ticker(s) from {os.path.basename(PERFORMANCE_IGNORE_PATH)}",
         )
+    if ignore_series_set:
+        print(
+            f"  Ignoring {len(ignore_series_set)} series: {', '.join(sorted(ignore_series_set))}",
+        )
 
-    write_events_csv(events, EVENTS_CSV_FILE, ignore_set)
+    write_events_csv(events, EVENTS_CSV_FILE, ignore_set, ignore_series_set)
     build_dashboard(
         events, OFFSET_DOLLARS, current_balance, PORTFOLIO_ALLOCATION, OUTPUT_FILE,
         ignore_tickers=ignore_set,
+        ignore_series=ignore_series_set,
     )
 
 

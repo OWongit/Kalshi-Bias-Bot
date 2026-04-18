@@ -158,15 +158,8 @@ def _try_entry(
 
     for ep in entry_prices:
         ep_f = float(ep)
-        ok = (
-            (buy_if_bid_gt_entry and float(bid_high) >= ep_f)
-            or (
-                not buy_if_bid_gt_entry
-                and math.isclose(float(bid_high), ep_f, rel_tol=0, abs_tol=1e-6)
-            )
-        )
-        if ok:
-            fill = float(bid_high) + bid_limit_offset
+        if ep_f == float(bid_close):
+            fill = float(ep) + bid_limit_offset
             return max(1.0, min(99.0, fill))
 
     return None
