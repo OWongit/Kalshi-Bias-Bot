@@ -17,6 +17,7 @@ chmod +x install.sh
 ```
 sudo systemctl status kalshi-trading-bot          # is it running?
 sudo systemctl restart kalshi-trading-bot         # restart after code/config changes
+sudo systemctl stop kalshi-trading-bot            # stop bot
 sudo systemctl disable --now kalshi-trading-bot   # stop and disable boot start
 journalctl -u kalshi-trading-bot -f               # follow logs
 
