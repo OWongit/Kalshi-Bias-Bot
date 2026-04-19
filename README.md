@@ -20,7 +20,6 @@ sudo systemctl restart kalshi-trading-bot         # restart after code/config ch
 sudo systemctl stop kalshi-trading-bot            # stop bot
 sudo systemctl disable --now kalshi-trading-bot   # stop and disable boot start
 journalctl -u kalshi-trading-bot -f               # follow logs
-
 ```
 
 Requires Raspberry Pi OS with Desktop and Desktop Autologin enabled (`raspi-config` → Boot → Desktop Autologin).
